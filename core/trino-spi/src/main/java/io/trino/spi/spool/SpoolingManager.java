@@ -45,4 +45,24 @@ public interface SpoolingManager
 
     // Converts spooled location back to the handle
     SpooledSegmentHandle handle(Slice identifier, Map<String, List<String>> headers);
+
+    /**
+     * Determines whether an exception thrown while spooling a segment is recoverable.
+     * <p>
+     * The engine may fall back to inlining a segment that failed to spool, but only for recoverable
+     * (transient) failures, such as a temporarily unavailable storage backend. Unrecoverable failures
+     * (for example invalid credentials or a misconfigured location) are not masked this way: the query
+     * fails instead, so that the underlying problem is surfaced rather than silently degrading to
+     * inlining on every segment.
+     * <p>
+     * The default implementation treats every failure as unrecoverable; implementations that can
+     * classify their failures should override this to opt into the inlining fallback for transient
+     * errors.
+     *
+     * @return {@code true} if the failure is transient and inlining the segment is a reasonable fallback
+     */
+    default boolean isRecoverableException(IOException exception)
+    {
+        return false;
+    }
 }

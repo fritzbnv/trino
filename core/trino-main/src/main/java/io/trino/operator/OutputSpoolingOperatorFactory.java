@@ -15,6 +15,7 @@ package io.trino.operator;
 
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.google.common.collect.ImmutableList;
+import io.airlift.log.Logger;
 import io.airlift.units.DataSize;
 import io.airlift.units.Duration;
 import io.trino.client.spooling.DataAttributes;
@@ -30,6 +31,7 @@ import io.trino.spi.spool.SpooledSegmentHandle;
 import io.trino.spi.spool.SpoolingContext;
 import io.trino.spi.spool.SpoolingManager;
 import io.trino.sql.planner.plan.PlanNodeId;
+import org.assertj.core.util.VisibleForTesting;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -146,7 +148,9 @@ public class OutputSpoolingOperatorFactory
     static class OutputSpoolingOperator
             implements Operator
     {
-        private static final long SPOOLING_THRESHOLD = DataSize.of(2, MEGABYTE).toBytes(); // this roughly translates to 400 KB compressed segment
+        private static final Logger log = Logger.get(OutputSpoolingOperator.class);
+        @VisibleForTesting
+        static final long SPOOLING_THRESHOLD = DataSize.of(2, MEGABYTE).toBytes(); // this roughly translates to 400 KB compressed segment
 
         private final SpoolingController controller;
         private final ZoneId clientZoneId;
@@ -306,18 +310,26 @@ public class OutputSpoolingOperatorFactory
 
                 OperationTimer overallTimer = new OperationTimer(false);
                 try (OutputStream output = spoolingManager.createOutputStream(segmentHandle)) {
-                    spooledSegmentsCount.incrementAndGet();
                     DataAttributes attributes = queryDataEncoder.encodeTo(output, partition)
                             .toBuilder()
                             .set(ROWS_COUNT, rows)
                             .set(EXPIRES_AT, ZonedDateTime.ofInstant(segmentHandle.expirationTime(), clientZoneId).toLocalDateTime().toString())
                             .build();
+                    spooledSegmentsCount.incrementAndGet();
                     spooledEncodedBytes.addAndGet(attributes.get(SEGMENT_SIZE, Integer.class));
                     // This page is small (hundreds of bytes) so there is no point in tracking its memory usage
                     spooledMetadataBuilder.add(SpooledMetadataBlock.forSpooledLocation(spoolingManager.location(segmentHandle), attributes));
                 }
                 catch (IOException e) {
-                    throw new UncheckedIOException(e);
+                    if (!inliningEnabled || !spoolingManager.isRecoverableException(e)) {
+                        // There is no fallback when inlining is disabled, and unrecoverable failures
+                        // (e.g. invalid credentials) are not masked by inlining - fail the query.
+                        throw new UncheckedIOException(e);
+                    }
+                    // Spooling storage is temporarily unavailable (e.g. object storage is down). Fall back
+                    // to inlining so that the protocol keeps working and the query can still return its results.
+                    log.warn(e, "Failed to spool segment of %s rows (%s bytes), falling back to inlining", rows, size);
+                    spooledMetadataBuilder.addAll(inlineFallback(partition));
                 }
                 finally {
                     overallTimer.end(spoolingTiming);
@@ -325,6 +337,20 @@ public class OutputSpoolingOperatorFactory
             }
 
             return serialize(spooledMetadataBuilder.build());
+        }
+
+        /**
+         * Inlines a partition that failed to spool. Spooled segments are typically much larger than
+         * inlined ones, so the failed partition is split into smaller chunks, each inlined as its own
+         * segment, to keep individual inlined segments reasonably sized.
+         */
+        private List<SpooledMetadataBlock> inlineFallback(List<Page> partition)
+        {
+            ImmutableList.Builder<SpooledMetadataBlock> builder = ImmutableList.builder();
+            for (List<Page> chunk : SpoolingPagePartitioner.partition(partition, SPOOLING_THRESHOLD)) {
+                builder.addAll(inline(chunk));
+            }
+            return builder.build();
         }
 
         private List<SpooledMetadataBlock> inline(List<Page> pages)

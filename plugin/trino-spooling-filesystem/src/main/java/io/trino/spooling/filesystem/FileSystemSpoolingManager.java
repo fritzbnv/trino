@@ -211,6 +211,14 @@ public class FileSystemSpoolingManager
     }
 
     @Override
+    public boolean isRecoverableException(IOException exception)
+    {
+        // Fatal backend errors (e.g. invalid credentials) surface as TrinoFileSystemException and are
+        // not worth retrying or masking; transient errors are recoverable and may be inlined instead.
+        return !TrinoFileSystem.isUnrecoverableException(exception);
+    }
+
+    @Override
     public SpooledSegmentHandle handle(Slice identifier, Map<String, List<String>> headers)
     {
         BasicSliceInput input = identifier.getInput();
