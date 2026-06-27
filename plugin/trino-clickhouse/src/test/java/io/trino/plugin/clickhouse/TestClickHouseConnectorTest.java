@@ -619,9 +619,15 @@ public class TestClickHouseConnectorTest
                 }
                 yield Optional.of(dataMappingTestSetup);
             }
-            // timestamp / timestamp(6) are supported (mapped to DateTime64). TIME and timestamp WITH TIME ZONE are not.
-            case "time", "time(6)",
-                 "timestamp(3) with time zone", "timestamp(6) with time zone" -> Optional.of(dataMappingTestSetup.asUnsupported());
+            // timestamp / timestamp(6) and timestamp WITH TIME ZONE are supported (DateTime64 / DateTime64(p,'UTC')). TIME is not.
+            case "time", "time(6)" -> Optional.of(dataMappingTestSetup.asUnsupported());
+            case "timestamp(3) with time zone", "timestamp(6) with time zone" -> {
+                // ClickHouse DateTime64 max is 2299-12-31; the smoke test's 9999 high value is out of range.
+                if (dataMappingTestSetup.getHighValueLiteral().contains("9999-12-31")) {
+                    yield Optional.empty();
+                }
+                yield Optional.of(dataMappingTestSetup);
+            }
             default -> Optional.of(dataMappingTestSetup);
         };
     }

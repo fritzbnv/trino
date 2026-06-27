@@ -82,10 +82,13 @@ import io.trino.spi.type.CharType;
 import io.trino.spi.type.DecimalType;
 import io.trino.spi.type.Decimals;
 import io.trino.spi.type.Int128;
+import io.trino.spi.type.LongTimestampWithTimeZone;
 import io.trino.spi.type.MapType;
 import io.trino.spi.type.NumberType;
 import io.trino.spi.type.StandardTypes;
+import io.trino.spi.type.TimeZoneKey;
 import io.trino.spi.type.TimestampType;
+import io.trino.spi.type.TimestampWithTimeZoneType;
 import io.trino.spi.type.Type;
 import io.trino.spi.type.TypeDescriptor;
 import io.trino.spi.type.TypeManager;
@@ -196,8 +199,12 @@ import static io.trino.spi.type.SmallintType.SMALLINT;
 import static io.trino.spi.type.TimestampType.TIMESTAMP_SECONDS;
 import static io.trino.spi.type.TimestampType.createTimestampType;
 import static io.trino.spi.type.TimestampWithTimeZoneType.TIMESTAMP_TZ_SECONDS;
+import static io.trino.spi.type.TimestampWithTimeZoneType.createTimestampWithTimeZoneType;
 import static io.trino.spi.type.Timestamps.MICROSECONDS_PER_SECOND;
+import static io.trino.spi.type.Timestamps.MILLISECONDS_PER_SECOND;
 import static io.trino.spi.type.Timestamps.NANOSECONDS_PER_MICROSECOND;
+import static io.trino.spi.type.Timestamps.NANOSECONDS_PER_MILLISECOND;
+import static io.trino.spi.type.Timestamps.PICOSECONDS_PER_NANOSECOND;
 import static io.trino.spi.type.TinyintType.TINYINT;
 import static io.trino.spi.type.TypeUtils.writeNativeValue;
 import static io.trino.spi.type.UuidType.javaUuidToTrinoUuid;
@@ -852,6 +859,22 @@ public class ClickHouseClient
                             shortTimestampWithTimeZoneReadFunction(),
                             shortTimestampWithTimeZoneWriteFunction(version, column.getTimeZone())));
                 }
+                if (columnDataType == ClickHouseDataType.DateTime64) {
+                    // DateTime64(scale, tz) preserves sub-second precision; map it to TIMESTAMP(scale) WITH TIME ZONE.
+                    int precision = column.getScale();
+                    verify(precision >= 0 && precision <= MAX_CLICKHOUSE_DATETIME64_SCALE, "Unexpected DateTime64 scale: %s", precision);
+                    TimestampWithTimeZoneType trinoType = createTimestampWithTimeZoneType(precision);
+                    if (trinoType.isShort()) {
+                        yield Optional.of(ColumnMapping.longMapping(
+                                trinoType,
+                                shortTimestampWithTimeZoneReadFunction(),
+                                shortDateTime64WithTimeZoneWriteFunction()));
+                    }
+                    yield Optional.of(ColumnMapping.objectMapping(
+                            trinoType,
+                            longTimestampWithTimeZoneReadFunction(),
+                            longTimestampWithTimeZoneWriteFunction()));
+                }
                 if (getUnsupportedTypeHandling(session) == CONVERT_TO_VARCHAR) {
                     yield mapToUnboundedVarchar(typeHandle);
                 }
@@ -1092,6 +1115,23 @@ public class ClickHouseClient
             }
             return WriteMapping.objectMapping(dataType, longTimestampWriteFunction(timestampType, timestampType.getPrecision()));
         }
+        if (type instanceof TimestampWithTimeZoneType timestampWithTimeZoneType) {
+            // The instant is stored in a DateTime64(p, 'UTC') column. NOTE: ClickHouse's DateTime64 time zone is a
+            // per-COLUMN display setting over a UTC instant; it has no per-ROW zone like Trino's "timestamp with time
+            // zone". So the absolute instant is preserved exactly, but the original per-row offset is normalized to UTC
+            // on read-back (e.g. '... +05:45' reads back as '... +00:00'). This is a ClickHouse limitation, acceptable
+            // for the diamond/serving use case which only needs the instant. Precision 0 keeps the existing DateTime path.
+            int precision = timestampWithTimeZoneType.getPrecision();
+            verify(precision >= 0 && precision <= MAX_CLICKHOUSE_DATETIME64_SCALE, "Unexpected timestamp with time zone precision: %s", precision);
+            if (precision == 0) {
+                return WriteMapping.longMapping("DateTime('UTC')", shortTimestampWithTimeZoneWriteFunction(getClickHouseServerVersion(session), TimeZone.getTimeZone(UTC)));
+            }
+            String dataType = format("DateTime64(%s, 'UTC')", precision);
+            if (timestampWithTimeZoneType.isShort()) {
+                return WriteMapping.longMapping(dataType, shortDateTime64WithTimeZoneWriteFunction());
+            }
+            return WriteMapping.objectMapping(dataType, longTimestampWithTimeZoneWriteFunction());
+        }
         if (type.equals(uuidType)) {
             return WriteMapping.sliceMapping("UUID", uuidWriteFunction());
         }
@@ -1259,6 +1299,42 @@ public class ClickHouseClient
             DATETIME.validate(version, instant.atZone(UTC).toLocalDateTime());
             statement.setObject(index, instant.atZone(columnTimeZone.toZoneId()));
         };
+    }
+
+    private static LongWriteFunction shortDateTime64WithTimeZoneWriteFunction()
+    {
+        // Short timestamp(<=3) with time zone written to a DateTime64(p, 'UTC') column. Unlike the DateTime variant,
+        // DateTime64 supports a far wider range, so the narrow DateTime range check is not applied.
+        return (statement, index, value) -> {
+            Instant instant = Instant.ofEpochMilli(unpackMillisUtc(value));
+            statement.setObject(index, instant.atZone(UTC));
+        };
+    }
+
+    private static ObjectReadFunction longTimestampWithTimeZoneReadFunction()
+    {
+        return ObjectReadFunction.of(LongTimestampWithTimeZone.class, (resultSet, columnIndex) -> {
+            ZonedDateTime zonedDateTime = resultSet.getObject(columnIndex, ZonedDateTime.class);
+            Instant instant = zonedDateTime.toInstant();
+            long epochMillis = instant.toEpochMilli();
+            int picosOfMilli = (int) ((long) (instant.getNano() % NANOSECONDS_PER_MILLISECOND) * PICOSECONDS_PER_NANOSECOND);
+            return LongTimestampWithTimeZone.fromEpochMillisAndFraction(epochMillis, picosOfMilli, TimeZoneKey.getTimeZoneKey(zonedDateTime.getZone().getId()));
+        });
+    }
+
+    private static ObjectWriteFunction longTimestampWithTimeZoneWriteFunction()
+    {
+        // High-precision timestamp with time zone (precision > 3): the value carries epoch millis + picos-of-milli.
+        // The instant is written to a DateTime64(p, 'UTC') column, preserving sub-millisecond precision in UTC.
+        return ObjectWriteFunction.of(LongTimestampWithTimeZone.class, (statement, index, value) -> {
+            long epochMillis = value.getEpochMillis();
+            long picosOfMilli = value.getPicosOfMilli();
+            Instant instant = Instant.ofEpochSecond(
+                    Math.floorDiv(epochMillis, MILLISECONDS_PER_SECOND),
+                    (Math.floorMod(epochMillis, MILLISECONDS_PER_SECOND) * NANOSECONDS_PER_MILLISECOND)
+                            + (picosOfMilli / PICOSECONDS_PER_NANOSECOND));
+            statement.setObject(index, instant.atZone(UTC));
+        });
     }
 
     private ColumnMapping ipAddressColumnMapping(String clickhouseType)
