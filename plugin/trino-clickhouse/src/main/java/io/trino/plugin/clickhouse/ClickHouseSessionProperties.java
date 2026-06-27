@@ -27,6 +27,7 @@ public class ClickHouseSessionProperties
         implements SessionPropertiesProvider
 {
     public static final String MAP_STRING_AS_VARCHAR = "map_string_as_varchar";
+    public static final String USE_FINAL = "use_final";
 
     private final List<PropertyMetadata<?>> sessionProperties;
 
@@ -38,6 +39,11 @@ public class ClickHouseSessionProperties
                         MAP_STRING_AS_VARCHAR,
                         "Map ClickHouse String and FixedString as varchar instead of varbinary",
                         clickHouseConfig.isMapStringAsVarchar(),
+                        false),
+                booleanProperty(
+                        USE_FINAL,
+                        "Read MergeTree-family tables with the FINAL modifier so engines like ReplacingMergeTree return deduplicated rows before background merge completes",
+                        clickHouseConfig.isUseFinal(),
                         false));
     }
 
@@ -50,5 +56,10 @@ public class ClickHouseSessionProperties
     public static boolean isMapStringAsVarchar(ConnectorSession session)
     {
         return session.getProperty(MAP_STRING_AS_VARCHAR, Boolean.class);
+    }
+
+    public static boolean isUseFinal(ConnectorSession session)
+    {
+        return session.getProperty(USE_FINAL, Boolean.class);
     }
 }

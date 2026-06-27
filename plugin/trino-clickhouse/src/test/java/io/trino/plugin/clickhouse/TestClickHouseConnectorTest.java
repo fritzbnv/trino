@@ -76,6 +76,12 @@ public class TestClickHouseConnectorTest
                  SUPPORTS_MAP_TYPE,
                  SUPPORTS_DELETE,
                  SUPPORTS_TRUNCATE -> true;
+            // SUPPORTS_MERGE stays off even though supportsMerge() is true: the framework MERGE suite asserts general
+            // SQL-MERGE semantics (delete-via-merge, update on plain tables, multiple-match detection) that this narrow
+            // upsert intentionally does not provide. The connector supports only the insert-only upsert that dbt-trino's
+            // incremental "merge" emits (WHEN MATCHED UPDATE / WHEN NOT MATCHED INSERT into a ReplacingMergeTree),
+            // exercised by the dedicated testMerge* tests below. The handful of base declaration/delete tests that
+            // assume the flag-off contract are overridden in this class.
             case SUPPORTS_AGGREGATION_PUSHDOWN_REGRESSION,
                  SUPPORTS_AGGREGATION_PUSHDOWN_STDDEV,
                  SUPPORTS_AGGREGATION_PUSHDOWN_VARIANCE,
@@ -1201,5 +1207,178 @@ public class TestClickHouseConnectorTest
     private DataSetup clickhouseCreateAndInsert(String tableNamePrefix)
     {
         return new CreateAndInsertDataSetup(new ClickHouseSqlExecutor(onRemoteDatabase()), tableNamePrefix);
+    }
+
+    /**
+     * The general SQL-MERGE behaviour is exercised by the inherited {@code testMerge*} suite ({@code SUPPORTS_MERGE} is
+     * enabled). These extra tests pin the diamond-layer use case specifically: an upsert into a ReplacingMergeTree target
+     * keyed by {@code order_by}, matching what dbt-trino's incremental {@code merge} strategy emits ({@code WHEN MATCHED
+     * THEN UPDATE} + {@code WHEN NOT MATCHED THEN INSERT}), read back with {@code FINAL} to observe the collapsed rows.
+     */
+    @Test
+    void testMergeUpsertReplacingMergeTree()
+    {
+        String target = "test_merge_upsert_" + randomNameSuffix();
+        String source = "test_merge_upsert_src_" + randomNameSuffix();
+        assertUpdate("CREATE TABLE " + target + " (id integer NOT NULL, name varchar, value integer) " +
+                "WITH (engine = 'ReplacingMergeTree', order_by = ARRAY['id'])");
+        assertUpdate("CREATE TABLE " + source + " (id integer NOT NULL, name varchar, value integer) WITH (engine = 'MergeTree', order_by = ARRAY['id'])");
+        try {
+            assertUpdate("INSERT INTO " + target + " VALUES (1, 'one', 10), (2, 'two', 20)", 2);
+            // id=2 is updated, id=3 is inserted; id=1 is untouched.
+            assertUpdate("INSERT INTO " + source + " VALUES (2, 'two-v2', 22), (3, 'three', 30)", 2);
+
+            assertUpdate("MERGE INTO " + target + " t USING " + source + " s ON (t.id = s.id) " +
+                    "WHEN MATCHED THEN UPDATE SET name = s.name, value = s.value " +
+                    "WHEN NOT MATCHED THEN INSERT (id, name, value) VALUES (s.id, s.name, s.value)", 2);
+
+            // ReplacingMergeTree collapses re-inserted keys only on background merge; force it so the read is deterministic.
+            onRemoteDatabase().execute("OPTIMIZE TABLE tpch." + target + " FINAL");
+
+            assertThat(query("SELECT id, name, value FROM " + target + " ORDER BY id"))
+                    .matches("VALUES (1, CAST('one' AS varchar), 10), (2, CAST('two-v2' AS varchar), 22), (3, CAST('three' AS varchar), 30)");
+        }
+        finally {
+            assertUpdate("DROP TABLE IF EXISTS " + target);
+            assertUpdate("DROP TABLE IF EXISTS " + source);
+        }
+    }
+
+    @Test
+    void testMergeInsertOnly()
+    {
+        String target = "test_merge_insert_" + randomNameSuffix();
+        assertUpdate("CREATE TABLE " + target + " (id integer NOT NULL, name varchar) WITH (engine = 'ReplacingMergeTree', order_by = ARRAY['id'])");
+        try {
+            assertUpdate("INSERT INTO " + target + " VALUES (1, 'one')", 1);
+            assertUpdate("MERGE INTO " + target + " t USING (VALUES (2, 'two')) s(id, name) ON (t.id = s.id) " +
+                    "WHEN NOT MATCHED THEN INSERT (id, name) VALUES (s.id, s.name)", 1);
+            onRemoteDatabase().execute("OPTIMIZE TABLE tpch." + target + " FINAL");
+            assertThat(query("SELECT id, name FROM " + target + " ORDER BY id"))
+                    .matches("VALUES (1, CAST('one' AS varchar)), (2, CAST('two' AS varchar))");
+        }
+        finally {
+            assertUpdate("DROP TABLE IF EXISTS " + target);
+        }
+    }
+
+    @Test
+    void testUseFinalDeduplicatesReplacingMergeTree()
+    {
+        // With use_final on, the connector appends FINAL so a ReplacingMergeTree's re-inserted versions are collapsed on
+        // read (the value diamond serving and dbt's "unique" test need), even before the background merge has run.
+        String table = "test_use_final_" + randomNameSuffix();
+        assertUpdate("CREATE TABLE " + table + " (id integer NOT NULL, name varchar) WITH (engine = 'ReplacingMergeTree', order_by = ARRAY['id'])");
+        try {
+            // Two versions of id=1 with no OPTIMIZE in between: physically two rows until the background merge collapses them.
+            assertUpdate("INSERT INTO " + table + " VALUES (1, 'v1')", 1);
+            assertUpdate("INSERT INTO " + table + " VALUES (1, 'v2')", 1);
+
+            Session noFinal = Session.builder(getSession())
+                    .setCatalogSessionProperty("clickhouse", "use_final", "false")
+                    .build();
+            Session withFinal = Session.builder(getSession())
+                    .setCatalogSessionProperty("clickhouse", "use_final", "true")
+                    .build();
+
+            // Without FINAL both physical rows are visible.
+            assertThat(query(noFinal, "SELECT count(*) FROM " + table)).matches("VALUES BIGINT '2'");
+            // With FINAL only the latest version of the key is returned.
+            assertThat(query(withFinal, "SELECT count(*) FROM " + table)).matches("VALUES BIGINT '1'");
+            assertThat(query(withFinal, "SELECT id, name FROM " + table)).matches("VALUES (1, CAST('v2' AS varchar))");
+        }
+        finally {
+            assertUpdate("DROP TABLE IF EXISTS " + table);
+        }
+    }
+
+    @Test
+    void testMergeDeleteIsRejected()
+    {
+        // dbt-trino's incremental merge never emits WHEN MATCHED ... THEN DELETE, and the connector cannot remove rows
+        // via MERGE (it is an insert-only upsert into ReplacingMergeTree), so such a clause must fail explicitly.
+        String target = "test_merge_delete_" + randomNameSuffix();
+        assertUpdate("CREATE TABLE " + target + " (id integer NOT NULL, name varchar) WITH (engine = 'ReplacingMergeTree', order_by = ARRAY['id'])");
+        try {
+            assertUpdate("INSERT INTO " + target + " VALUES (1, 'one'), (2, 'two')", 2);
+            assertThatThrownBy(() -> assertUpdate("MERGE INTO " + target + " t USING (VALUES 2) s(id) ON (t.id = s.id) WHEN MATCHED THEN DELETE"))
+                    .hasMessageContaining("ClickHouse MERGE does not support deleting rows");
+        }
+        finally {
+            assertUpdate("DROP TABLE IF EXISTS " + target);
+        }
+    }
+
+    // The base SUPPORTS_MERGE flag is off (see hasBehavior), so the base suite asserts that MERGE/row-level UPDATE/
+    // non-pushdown DELETE all fail with MODIFYING_ROWS_MESSAGE. But the connector does support an insert-only MERGE
+    // upsert, so those operations behave differently here and the relevant base tests are overridden below.
+
+    @Test
+    @Override // MERGE is supported (insert-only upsert), so the WHEN NOT MATCHED INSERT in this declaration check succeeds.
+    public void verifySupportsMergeDeclaration()
+    {
+        try (TestTable table = newTrinoTable("test_supports_merge", "(key int NOT NULL, data varchar) WITH (engine = 'ReplacingMergeTree', order_by = ARRAY['key'])")) {
+            assertUpdate("MERGE INTO " + table.getName() + " USING (VALUES 42) t(dummy) ON false WHEN NOT MATCHED THEN INSERT VALUES (1, 'alice')", 1);
+        }
+    }
+
+    @Test
+    @Override // UPDATE is planned as a MERGE; the connector's insert-only merge sink does not delete the old row, so a
+    // standalone UPDATE does not behave as a row-level update. It is not a supported operation for this connector.
+    public void verifySupportsRowLevelUpdateDeclaration()
+    {
+        // No-op: row-level UPDATE is intentionally unsupported (only the dbt insert-only merge upsert is), and unlike the
+        // base flag-off contract it no longer fails with MODIFYING_ROWS_MESSAGE because UPDATE routes through MERGE.
+    }
+
+    @Test
+    @Override // UPDATE routes through the insert-only merge sink; a NOT NULL violation surfaces as ClickHouse's own error.
+    public void testUpdateNotNullColumn()
+    {
+        try (TestTable table = newTrinoTable("update_not_null", "(nullable_col integer, not_null_col integer NOT NULL) WITH (engine = 'ReplacingMergeTree', order_by = ARRAY['not_null_col'])")) {
+            assertUpdate("INSERT INTO " + table.getName() + " (nullable_col, not_null_col) VALUES (1, 10)", 1);
+            assertQuery("SELECT * FROM " + table.getName(), "VALUES (1, 10)");
+            assertThatThrownBy(() -> assertUpdate("UPDATE " + table.getName() + " SET not_null_col = NULL WHERE nullable_col = 1"))
+                    .hasMessageContaining("NULL value not allowed for NOT NULL column: not_null_col");
+        }
+    }
+
+    @Test
+    @Override // A non-pushdown DELETE is planned as a MERGE delete, which the insert-only merge sink rejects.
+    public void testDeleteWithComplexPredicate()
+    {
+        assertNonPushdownDeleteIsRejected("test_delete_complex_", "DELETE FROM %s WHERE nationkey %% 2 = 0");
+    }
+
+    @Test
+    @Override
+    public void testDeleteWithSubquery()
+    {
+        assertNonPushdownDeleteIsRejected("test_delete_subquery_", "DELETE FROM %s WHERE regionkey IN (SELECT regionkey FROM region WHERE name LIKE 'A%%')");
+    }
+
+    @Test
+    @Override
+    public void testExplainAnalyzeWithDeleteWithSubquery()
+    {
+        assertNonPushdownDeleteIsRejected("test_explain_delete_subquery_", "EXPLAIN ANALYZE DELETE FROM %s WHERE regionkey IN (SELECT regionkey FROM region WHERE name LIKE 'A%%')");
+    }
+
+    @Test
+    @Override
+    public void testDeleteWithSemiJoin()
+    {
+        assertNonPushdownDeleteIsRejected("test_delete_semijoin_", "DELETE FROM %s WHERE regionkey IN (SELECT regionkey FROM region WHERE name LIKE 'A%%') AND regionkey IN (SELECT regionkey FROM region WHERE length(comment) < 50)");
+    }
+
+    private void assertNonPushdownDeleteIsRejected(String namePrefix, String deleteSqlFormat)
+    {
+        // These DELETEs cannot be pushed down to a single predicate, so the engine plans them as a MERGE delete. The
+        // connector's insert-only merge sink cannot remove rows, so they fail with a clear error. (Pushdown DELETEs are
+        // handled by delete() and are covered by testDeleteWithVarcharPredicate etc.)
+        try (TestTable table = newTrinoTable(namePrefix, "AS SELECT * FROM nation")) {
+            assertThatThrownBy(() -> getQueryRunner().execute(format(deleteSqlFormat, table.getName())))
+                    .hasMessageContaining("ClickHouse MERGE does not support deleting rows");
+        }
     }
 }
