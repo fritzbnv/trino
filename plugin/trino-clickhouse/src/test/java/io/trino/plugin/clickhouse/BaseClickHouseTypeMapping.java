@@ -51,6 +51,8 @@ import static io.trino.spi.type.IntegerType.INTEGER;
 import static io.trino.spi.type.RealType.REAL;
 import static io.trino.spi.type.SmallintType.SMALLINT;
 import static io.trino.spi.type.TimestampType.createTimestampType;
+import static io.trino.spi.type.TimestampWithTimeZoneType.TIMESTAMP_TZ_MICROS;
+import static io.trino.spi.type.TimestampWithTimeZoneType.TIMESTAMP_TZ_MILLIS;
 import static io.trino.spi.type.TimestampWithTimeZoneType.TIMESTAMP_TZ_SECONDS;
 import static io.trino.spi.type.TinyintType.TINYINT;
 import static io.trino.spi.type.VarbinaryType.VARBINARY;
@@ -982,6 +984,29 @@ public abstract class BaseClickHouseTypeMapping
                     .execute(getQueryRunner(), session, trinoCreateAsSelect("test_datetime64"))
                     .execute(getQueryRunner(), session, trinoCreateAndInsert(session, "test_datetime64"))
                     .execute(getQueryRunner(), session, trinoCreateAndInsert("test_datetime64"));
+        }
+    }
+
+    @Test
+    public void testClickHouseDateTime64WithTimeZone()
+    {
+        for (ZoneId sessionZone : timezones()) {
+            Session session = Session.builder(getSession())
+                    .setTimeZoneKey(TimeZoneKey.getTimeZoneKey(sessionZone.getId()))
+                    .build();
+
+            // Write path: a Trino timestamp(p) with time zone column creates a ClickHouse DateTime64(p, 'UTC') and the
+            // instant round-trips at microsecond precision. ClickHouse has no per-row zone (its DateTime64 zone is a
+            // per-column display setting over a UTC instant), so the original offset is intentionally normalized to UTC
+            // on read-back (e.g. '+05:45' below becomes 'UTC'); only the absolute instant is preserved.
+            SqlDataTypeTest.create()
+                    .addRoundTrip("timestamp(6) with time zone", "TIMESTAMP '2024-06-26 13:45:01.123456 UTC'", TIMESTAMP_TZ_MICROS, "TIMESTAMP '2024-06-26 13:45:01.123456 UTC'")
+                    .addRoundTrip("timestamp(6) with time zone", "TIMESTAMP '2024-06-26 13:45:01.123456 +05:45'", TIMESTAMP_TZ_MICROS, "TIMESTAMP '2024-06-26 08:00:01.123456 UTC'")
+                    .addRoundTrip("timestamp(3) with time zone", "TIMESTAMP '2024-06-26 13:45:01.123 +02:00'", TIMESTAMP_TZ_MILLIS, "TIMESTAMP '2024-06-26 11:45:01.123 UTC'")
+                    .execute(getQueryRunner(), session, trinoCreateAsSelect(session, "test_datetime64_tz"))
+                    .execute(getQueryRunner(), session, trinoCreateAsSelect("test_datetime64_tz"))
+                    .execute(getQueryRunner(), session, trinoCreateAndInsert(session, "test_datetime64_tz"))
+                    .execute(getQueryRunner(), session, trinoCreateAndInsert("test_datetime64_tz"));
         }
     }
 
