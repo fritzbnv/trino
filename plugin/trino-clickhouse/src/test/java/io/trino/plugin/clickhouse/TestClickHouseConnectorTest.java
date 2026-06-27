@@ -72,14 +72,15 @@ public class TestClickHouseConnectorTest
                  SUPPORTS_PREDICATE_EXPRESSION_PUSHDOWN_WITH_LIKE,
                  SUPPORTS_PREDICATE_PUSHDOWN_WITH_VARCHAR_EQUALITY,
                  SUPPORTS_TOPN_PUSHDOWN,
+                 SUPPORTS_ARRAY,
+                 SUPPORTS_MAP_TYPE,
+                 SUPPORTS_DELETE,
                  SUPPORTS_TRUNCATE -> true;
             case SUPPORTS_AGGREGATION_PUSHDOWN_REGRESSION,
                  SUPPORTS_AGGREGATION_PUSHDOWN_STDDEV,
                  SUPPORTS_AGGREGATION_PUSHDOWN_VARIANCE,
-                 SUPPORTS_ARRAY,
-                 SUPPORTS_DELETE,
+                 SUPPORTS_PREDICATE_ARITHMETIC_EXPRESSION_PUSHDOWN,
                  SUPPORTS_DROP_NOT_NULL_CONSTRAINT,
-                 SUPPORTS_MAP_TYPE,
                  SUPPORTS_NEGATIVE_DATE,
                  SUPPORTS_ROW_TYPE,
                  SUPPORTS_SET_COLUMN_TYPE,
@@ -302,8 +303,27 @@ public class TestClickHouseConnectorTest
                         "   comment varchar\n" +
                         ")\n" +
                         "WITH (\n" +
-                        "   engine = 'LOG'\n" +
+                        "   engine = 'MERGETREE'\n" +
                         ")");
+    }
+
+    @Test
+    @Override
+    public void testInsertArray()
+    {
+        // ClickHouse cannot represent a NULL array (Nullable(Array) is illegal); an unset array column defaults to an
+        // empty array, not NULL. The base test expects an unset array column to read back as NULL, which is impossible
+        // here, so this override uses ClickHouse-appropriate expectations: null array ELEMENTS work, an unset array
+        // column reads back as empty.
+        try (TestTable table = newTrinoTable("test_insert_array_", "(a array(double), b array(bigint))")) {
+            assertUpdate("INSERT INTO " + table.getName() + " (a) VALUES (ARRAY[null])", 1);
+            assertUpdate("INSERT INTO " + table.getName() + " (a, b) VALUES (ARRAY[1.23E1], ARRAY[1.23E1])", 1);
+            // Null array element in 'a' round-trips; unset 'b' is an empty array (ClickHouse default), not NULL.
+            assertQuery(
+                    "SELECT a[1], cardinality(b) FROM " + table.getName(),
+                    "VALUES (null, 0), (12.3, 1)");
+            assertQuery("SELECT b[1] FROM " + table.getName() + " WHERE cardinality(b) > 0", "VALUES 12");
+        }
     }
 
     @Override
@@ -571,7 +591,8 @@ public class TestClickHouseConnectorTest
         return new TestTable(
                 onRemoteDatabase(),
                 "tpch.test_unsupported_column_present",
-                "(one bigint, two Array(UInt8), three String) ENGINE=Log");
+                // Array is now supported by the connector; Point remains unsupported.
+                "(one bigint, two Point, three String) ENGINE=Log");
     }
 
     @Override
@@ -597,10 +618,9 @@ public class TestClickHouseConnectorTest
                 }
                 return Optional.of(dataMappingTestSetup);
 
+            // timestamp / timestamp(6) are supported (mapped to DateTime64). TIME and timestamp WITH TIME ZONE are not.
             case "time":
             case "time(6)":
-            case "timestamp":
-            case "timestamp(6)":
             case "timestamp(3) with time zone":
             case "timestamp(6) with time zone":
                 return Optional.of(dataMappingTestSetup.asUnsupported());

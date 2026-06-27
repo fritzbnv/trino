@@ -59,6 +59,8 @@ import static io.trino.spi.type.VarcharType.createUnboundedVarcharType;
 import static io.trino.testing.TestingSession.testSessionBuilder;
 import static io.trino.type.IpAddressType.IPADDRESS;
 import static java.lang.String.format;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.jupiter.api.TestInstance.Lifecycle.PER_CLASS;
 
 @TestInstance(PER_CLASS)
@@ -949,6 +951,145 @@ public abstract class BaseClickHouseTypeMapping
                     .execute(getQueryRunner(), session, clickhouseCreateAndInsert("tpch.test_timestamp"));
             timestampTest("datetime")
                     .execute(getQueryRunner(), session, clickhouseCreateAndInsert("tpch.test_datetime"));
+        }
+    }
+
+    @Test
+    public void testClickHouseDateTime64()
+    {
+        for (ZoneId sessionZone : timezones()) {
+            Session session = Session.builder(getSession())
+                    .setTimeZoneKey(TimeZoneKey.getTimeZoneKey(sessionZone.getId()))
+                    .build();
+
+            // Read path: a ClickHouse DateTime64(precision) column must be read with that precision, not truncated to milliseconds.
+            SqlDataTypeTest.create()
+                    .addRoundTrip("DateTime64(0)", "'2024-06-26 13:45:01'", createTimestampType(0), "TIMESTAMP '2024-06-26 13:45:01'")
+                    .addRoundTrip("DateTime64(3)", "'2024-06-26 13:45:01.123'", createTimestampType(3), "TIMESTAMP '2024-06-26 13:45:01.123'")
+                    .addRoundTrip("DateTime64(6)", "'2024-06-26 13:45:01.123456'", createTimestampType(6), "TIMESTAMP '2024-06-26 13:45:01.123456'")
+                    .addRoundTrip("DateTime64(6)", "'1999-12-31 23:59:59.000001'", createTimestampType(6), "TIMESTAMP '1999-12-31 23:59:59.000001'")
+                    .addRoundTrip("DateTime64(9)", "'2024-06-26 13:45:01.123456789'", createTimestampType(9), "TIMESTAMP '2024-06-26 13:45:01.123456789'")
+                    .addRoundTrip("Nullable(DateTime64(6))", "NULL", createTimestampType(6), "CAST(NULL AS TIMESTAMP(6))")
+                    .execute(getQueryRunner(), session, clickhouseCreateAndInsert("tpch.test_datetime64"));
+
+            // Write path: a Trino timestamp(precision) column must create a ClickHouse DateTime64(precision) and round-trip with full precision.
+            SqlDataTypeTest.create()
+                    .addRoundTrip("timestamp(3)", "TIMESTAMP '2024-06-26 13:45:01.123'", createTimestampType(3), "TIMESTAMP '2024-06-26 13:45:01.123'")
+                    .addRoundTrip("timestamp(6)", "TIMESTAMP '2024-06-26 13:45:01.123456'", createTimestampType(6), "TIMESTAMP '2024-06-26 13:45:01.123456'")
+                    .addRoundTrip("timestamp(6)", "TIMESTAMP '1999-12-31 23:59:59.000001'", createTimestampType(6), "TIMESTAMP '1999-12-31 23:59:59.000001'")
+                    .addRoundTrip("timestamp(9)", "TIMESTAMP '2024-06-26 13:45:01.123456789'", createTimestampType(9), "TIMESTAMP '2024-06-26 13:45:01.123456789'")
+                    .execute(getQueryRunner(), session, trinoCreateAsSelect(session, "test_datetime64"))
+                    .execute(getQueryRunner(), session, trinoCreateAsSelect("test_datetime64"))
+                    .execute(getQueryRunner(), session, trinoCreateAndInsert(session, "test_datetime64"))
+                    .execute(getQueryRunner(), session, trinoCreateAndInsert("test_datetime64"));
+        }
+    }
+
+    @Test
+    public void testClickHouseArrayInteger()
+    {
+        // SqlDataTypeTest cannot be used for arrays: its verification compares the column with an array literal via "=",
+        // which ClickHouse rejects (Array vs Tuple). Read/write are verified with explicit queries instead.
+
+        // Read path: ClickHouse Array(IntN) is read as Trino ARRAY(bigint/integer), including a nullable element.
+        try (TestTable table = new TestTable(
+                onRemoteDatabase(),
+                "tpch.test_array_integer_read",
+                "(id Int32, a64 Array(Int64), a32 Array(Int32), an Array(Nullable(Int64))) ENGINE=Log")) {
+            onRemoteDatabase().execute("INSERT INTO " + table.getName() + " VALUES (1, [10, 20, 9223372036854775807], [1, 2, 3], [10, NULL, 30])");
+            assertThat(query("SELECT a64, a32, an FROM " + table.getName()))
+                    .matches("VALUES (ARRAY[BIGINT '10', 20, 9223372036854775807], ARRAY[1, 2, 3], ARRAY[BIGINT '10', NULL, 30])");
+        }
+
+        // Write path: Trino ARRAY(bigint/integer) creates a ClickHouse Array(IntN) and round-trips.
+        try (TestTable table = newTrinoTable("test_array_integer_write", "(a64 array(bigint), a32 array(integer))")) {
+            assertUpdate("INSERT INTO " + table.getName() + " VALUES (ARRAY[BIGINT '10', 20, 9223372036854775807], ARRAY[1, 2, 3])", 1);
+            assertThat(query("SELECT a64, a32 FROM " + table.getName()))
+                    .matches("VALUES (ARRAY[BIGINT '10', 20, 9223372036854775807], ARRAY[1, 2, 3])");
+        }
+    }
+
+    @Test
+    public void testClickHouseArrayString()
+    {
+        // ClickHouse String maps to varchar only with map_string_as_varchar enabled; otherwise varbinary.
+        Session session = mapStringAsVarcharSession();
+
+        // Read path: ClickHouse Array(String) is read as Trino ARRAY(varchar).
+        try (TestTable table = new TestTable(
+                onRemoteDatabase(),
+                "tpch.test_array_string_read",
+                "(id Int32, a Array(String)) ENGINE=Log")) {
+            onRemoteDatabase().execute("INSERT INTO " + table.getName() + " VALUES (1, ['a', 'b', 'c'])");
+            assertThat(query(session, "SELECT a FROM " + table.getName()))
+                    .matches("VALUES ARRAY[VARCHAR 'a', 'b', 'c']");
+        }
+
+        // Write path: Trino ARRAY(varchar) creates a ClickHouse Array(String) and round-trips.
+        try (TestTable table = newTrinoTable("test_array_string_write", "(a array(varchar))")) {
+            assertUpdate(session, "INSERT INTO " + table.getName() + " VALUES (ARRAY[VARCHAR 'a', 'b', 'c'])", 1);
+            assertThat(query(session, "SELECT a FROM " + table.getName()))
+                    .matches("VALUES ARRAY[VARCHAR 'a', 'b', 'c']");
+        }
+    }
+
+    @Test
+    public void testClickHouseJson()
+    {
+        // A Trino json column is stored in a ClickHouse String column (the connector inserts via RowBinary, which the
+        // 0.9.8 driver cannot use to write ClickHouse's native JSON type). This lets a diamond model copy gold's json
+        // columns with a bare SELECT *; the JSON text round-trips and is queryable in ClickHouse via JSONExtract*().
+        // ClickHouse String maps back to varchar only with map_string_as_varchar; otherwise varbinary.
+        // The diamond model shape is CREATE TABLE AS SELECT * — exercise exactly that: a json-typed source column
+        // becomes a ClickHouse String column carrying the verbatim JSON text.
+        Session session = mapStringAsVarcharSession();
+
+        try (TestTable table = newTrinoTable(
+                "test_json_ctas",
+                "AS SELECT 1 id, JSON '{\"a\":1,\"b\":2}' j UNION ALL SELECT 2, CAST(NULL AS json)")) {
+            assertThat(query(session, "SELECT j FROM " + table.getName() + " WHERE id = 1"))
+                    .matches("VALUES VARCHAR '{\"a\":1,\"b\":2}'");
+            assertThat(query(session, "SELECT j FROM " + table.getName() + " WHERE id = 2"))
+                    .matches("VALUES CAST(NULL AS varchar)");
+            assertThat(query("SELECT count(*) FROM " + table.getName())).matches("VALUES BIGINT '2'");
+        }
+    }
+
+    @Test
+    public void testClickHouseMap()
+    {
+        // SqlDataTypeTest cannot verify map columns (its "= literal" check is rejected by ClickHouse), so read/write
+        // are checked with explicit queries. ClickHouse String maps back to varchar with map_string_as_varchar.
+        Session session = mapStringAsVarcharSession();
+
+        // Read path: ClickHouse Map(K,V) is read as Trino MAP(k,v), including the multimap Map(String, Array(Int64)).
+        try (TestTable table = new TestTable(
+                onRemoteDatabase(),
+                "tpch.test_map_read",
+                "(id Int32, m_f64 Map(String, Float64), m_i64 Map(String, Int64), m_arr Map(String, Array(Int64))) ENGINE=Log")) {
+            onRemoteDatabase().execute("INSERT INTO " + table.getName() + " VALUES " +
+                    "(1, {'x': 1.5, 'y': 2.25}, {'a': 7, 'b': 3}, {'k1': [11, 12], 'k2': [99]})");
+            assertThat(query(session, "SELECT m_f64 FROM " + table.getName()))
+                    .matches("VALUES MAP(ARRAY[VARCHAR 'x', 'y'], ARRAY[DOUBLE '1.5', 2.25])");
+            assertThat(query(session, "SELECT m_i64 FROM " + table.getName()))
+                    .matches("VALUES MAP(ARRAY[VARCHAR 'a', 'b'], ARRAY[BIGINT '7', 3])");
+            assertThat(query(session, "SELECT m_arr FROM " + table.getName()))
+                    .matches("VALUES MAP(ARRAY[VARCHAR 'k1', 'k2'], ARRAY[ARRAY[BIGINT '11', 12], ARRAY[BIGINT '99']])");
+        }
+
+        // Write path: Trino MAP(...) creates a ClickHouse Map(...) and round-trips (incl. the multimap).
+        try (TestTable table = newTrinoTable(
+                "test_map_write",
+                "(m_f64 map(varchar, double), m_i64 map(varchar, bigint), m_arr map(varchar, array(bigint)))")) {
+            assertUpdate(session, "INSERT INTO " + table.getName() + " VALUES (" +
+                    "MAP(ARRAY[VARCHAR 'x', 'y'], ARRAY[DOUBLE '1.5', 2.25]), " +
+                    "MAP(ARRAY[VARCHAR 'a', 'b'], ARRAY[BIGINT '7', 3]), " +
+                    "MAP(ARRAY[VARCHAR 'k1', 'k2'], ARRAY[ARRAY[BIGINT '11', 12], ARRAY[BIGINT '99']]))", 1);
+            assertThat(query(session, "SELECT m_f64, m_i64, m_arr FROM " + table.getName()))
+                    .matches("VALUES (" +
+                            "MAP(ARRAY[VARCHAR 'x', 'y'], ARRAY[DOUBLE '1.5', 2.25]), " +
+                            "MAP(ARRAY[VARCHAR 'a', 'b'], ARRAY[BIGINT '7', 3]), " +
+                            "MAP(ARRAY[VARCHAR 'k1', 'k2'], ARRAY[ARRAY[BIGINT '11', 12], ARRAY[BIGINT '99']]))");
         }
     }
 

@@ -42,7 +42,10 @@ public final class ClickHouseTableProperties
     public static final String PRIMARY_KEY_PROPERTY = "primary_key"; //optional
     public static final String SAMPLE_BY_PROPERTY = "sample_by"; //optional
 
-    public static final ClickHouseEngineType DEFAULT_TABLE_ENGINE = ClickHouseEngineType.LOG;
+    // MergeTree is the default so that tables support row-level DELETE (needed for dbt delete+insert) and are usable
+    // as a serving store. When no order_by is given, the connector emits "ORDER BY tuple()". (Was Log historically,
+    // but Log supports neither DELETE nor any index.)
+    public static final ClickHouseEngineType DEFAULT_TABLE_ENGINE = ClickHouseEngineType.MERGETREE;
 
     private final List<PropertyMetadata<?>> tableProperties;
 
