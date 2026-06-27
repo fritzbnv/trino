@@ -16,6 +16,7 @@ package io.trino.plugin.clickhouse;
 import com.clickhouse.client.ClickHouseVersionUtils;
 import com.clickhouse.data.ClickHouseColumn;
 import com.clickhouse.data.ClickHouseDataType;
+import com.clickhouse.jdbc.internal.JdbcUtils;
 import com.google.common.base.Enums;
 import com.google.common.base.Splitter;
 import com.google.common.collect.ImmutableList;
@@ -44,7 +45,9 @@ import io.trino.plugin.jdbc.JdbcTableHandle;
 import io.trino.plugin.jdbc.JdbcTypeHandle;
 import io.trino.plugin.jdbc.LongReadFunction;
 import io.trino.plugin.jdbc.LongWriteFunction;
+import io.trino.plugin.jdbc.ObjectReadFunction;
 import io.trino.plugin.jdbc.ObjectWriteFunction;
+import io.trino.plugin.jdbc.PreparedQuery;
 import io.trino.plugin.jdbc.QueryBuilder;
 import io.trino.plugin.jdbc.RemoteTableName;
 import io.trino.plugin.jdbc.SliceWriteFunction;
@@ -62,6 +65,10 @@ import io.trino.plugin.jdbc.expression.JdbcConnectorExpressionRewriterBuilder;
 import io.trino.plugin.jdbc.expression.ParameterizedExpression;
 import io.trino.plugin.jdbc.logging.RemoteQueryModifier;
 import io.trino.spi.TrinoException;
+import io.trino.spi.block.Block;
+import io.trino.spi.block.BlockBuilder;
+import io.trino.spi.block.MapBlockBuilder;
+import io.trino.spi.block.SqlMap;
 import io.trino.spi.connector.AggregateFunction;
 import io.trino.spi.connector.ColumnHandle;
 import io.trino.spi.connector.ColumnMetadata;
@@ -70,15 +77,19 @@ import io.trino.spi.connector.ConnectorSession;
 import io.trino.spi.connector.ConnectorTableMetadata;
 import io.trino.spi.expression.ConnectorExpression;
 import io.trino.spi.expression.Variable;
+import io.trino.spi.type.ArrayType;
 import io.trino.spi.type.CharType;
 import io.trino.spi.type.DecimalType;
 import io.trino.spi.type.Decimals;
 import io.trino.spi.type.Int128;
+import io.trino.spi.type.MapType;
 import io.trino.spi.type.NumberType;
 import io.trino.spi.type.StandardTypes;
+import io.trino.spi.type.TimestampType;
 import io.trino.spi.type.Type;
 import io.trino.spi.type.TypeDescriptor;
 import io.trino.spi.type.TypeManager;
+import io.trino.spi.type.TypeOperators;
 import io.trino.spi.type.VarbinaryType;
 import io.trino.spi.type.VarcharType;
 import jakarta.annotation.Nullable;
@@ -99,7 +110,9 @@ import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.ZonedDateTime;
+import java.util.ArrayList;
 import java.util.Collection;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
@@ -117,6 +130,7 @@ import static com.google.common.base.Strings.emptyToNull;
 import static com.google.common.base.Strings.isNullOrEmpty;
 import static com.google.common.base.Verify.verify;
 import static com.google.common.collect.ImmutableMap.toImmutableMap;
+import static io.airlift.slice.Slices.utf8Slice;
 import static io.airlift.slice.Slices.wrappedBuffer;
 import static io.trino.plugin.clickhouse.ClickHouseSessionProperties.isMapStringAsVarchar;
 import static io.trino.plugin.clickhouse.ClickHouseTableProperties.ENGINE_PROPERTY;
@@ -147,6 +161,7 @@ import static io.trino.plugin.jdbc.StandardColumnMappings.integerColumnMapping;
 import static io.trino.plugin.jdbc.StandardColumnMappings.integerWriteFunction;
 import static io.trino.plugin.jdbc.StandardColumnMappings.longDecimalReadFunction;
 import static io.trino.plugin.jdbc.StandardColumnMappings.longDecimalWriteFunction;
+import static io.trino.plugin.jdbc.StandardColumnMappings.longTimestampWriteFunction;
 import static io.trino.plugin.jdbc.StandardColumnMappings.numberReadFunction;
 import static io.trino.plugin.jdbc.StandardColumnMappings.numberWriteFunction;
 import static io.trino.plugin.jdbc.StandardColumnMappings.realWriteFunction;
@@ -155,6 +170,7 @@ import static io.trino.plugin.jdbc.StandardColumnMappings.smallintColumnMapping;
 import static io.trino.plugin.jdbc.StandardColumnMappings.smallintWriteFunction;
 import static io.trino.plugin.jdbc.StandardColumnMappings.timestampColumnMapping;
 import static io.trino.plugin.jdbc.StandardColumnMappings.timestampReadFunction;
+import static io.trino.plugin.jdbc.StandardColumnMappings.timestampWriteFunction;
 import static io.trino.plugin.jdbc.StandardColumnMappings.tinyintColumnMapping;
 import static io.trino.plugin.jdbc.StandardColumnMappings.tinyintWriteFunction;
 import static io.trino.plugin.jdbc.StandardColumnMappings.varbinaryColumnMapping;
@@ -177,12 +193,13 @@ import static io.trino.spi.type.DoubleType.DOUBLE;
 import static io.trino.spi.type.IntegerType.INTEGER;
 import static io.trino.spi.type.RealType.REAL;
 import static io.trino.spi.type.SmallintType.SMALLINT;
-import static io.trino.spi.type.TimestampType.TIMESTAMP_MILLIS;
 import static io.trino.spi.type.TimestampType.TIMESTAMP_SECONDS;
+import static io.trino.spi.type.TimestampType.createTimestampType;
 import static io.trino.spi.type.TimestampWithTimeZoneType.TIMESTAMP_TZ_SECONDS;
 import static io.trino.spi.type.Timestamps.MICROSECONDS_PER_SECOND;
 import static io.trino.spi.type.Timestamps.NANOSECONDS_PER_MICROSECOND;
 import static io.trino.spi.type.TinyintType.TINYINT;
+import static io.trino.spi.type.TypeUtils.writeNativeValue;
 import static io.trino.spi.type.UuidType.javaUuidToTrinoUuid;
 import static io.trino.spi.type.UuidType.trinoUuidToJavaUuid;
 import static io.trino.spi.type.VarcharType.createUnboundedVarcharType;
@@ -207,6 +224,9 @@ public class ClickHouseClient
 
     private static final DecimalType UINT64_TYPE = createDecimalType(20, 0);
 
+    // ClickHouse DateTime64 supports a fractional scale from 0 (seconds) up to 9 (nanoseconds).
+    private static final int MAX_CLICKHOUSE_DATETIME64_SCALE = 9;
+
     // An empty character means that the table doesn't have a comment in ClickHouse
     private static final String NO_COMMENT = "";
 
@@ -216,6 +236,8 @@ public class ClickHouseClient
     private final AggregateFunctionRewriter<JdbcExpression, ?> aggregateFunctionRewriter;
     private final Type uuidType;
     private final Type ipAddressType;
+    private final Type jsonType;
+    private final TypeOperators typeOperators;
     private final AtomicReference<ClickHouseVersionUtils> clickHouseVersion = new AtomicReference<>();
 
     @Inject
@@ -230,6 +252,8 @@ public class ClickHouseClient
         super("\"", connectionFactory, queryBuilder, config.getJdbcTypesMappedToVarchar(), identifierMapping, queryModifier, false);
         this.uuidType = typeManager.getType(new TypeDescriptor(StandardTypes.UUID));
         this.ipAddressType = typeManager.getType(new TypeDescriptor(StandardTypes.IPADDRESS));
+        this.jsonType = typeManager.getType(new TypeDescriptor(StandardTypes.JSON));
+        this.typeOperators = typeManager.getTypeOperators();
         JdbcTypeHandle bigintTypeHandle = new JdbcTypeHandle(Types.BIGINT, Optional.of("bigint"), Optional.empty(), Optional.empty(), Optional.empty(), Optional.empty());
         this.connectorExpressionRewriter = JdbcConnectorExpressionRewriterBuilder.newBuilder()
                 .addStandardRules(this::quoted)
@@ -480,16 +504,36 @@ public class ClickHouseClient
         StringBuilder sb = new StringBuilder()
                 .append(quoted(columnName))
                 .append(" ");
-        if (column.isNullable()) {
+        String dataType = toWriteMapping(session, column.getType()).getDataType();
+        // ClickHouse does not allow Array/Map to be wrapped in Nullable (they carry their own absence semantics:
+        // an empty container), so such columns are emitted without the Nullable wrapper.
+        if (column.isNullable() && !isClickHouseNonNullableContainer(column.getType())) {
             // set column nullable property explicitly
-            sb.append("Nullable(").append(toWriteMapping(session, column.getType()).getDataType()).append(")");
+            sb.append("Nullable(").append(dataType).append(")");
         }
         else {
             // By default, the clickhouse column is not allowed to be null
-            sb.append(toWriteMapping(session, column.getType()).getDataType());
+            sb.append(dataType);
         }
         column.getComment().ifPresent(comment -> sb.append(format(" COMMENT %s", clickhouseVarcharLiteral(comment))));
         return sb.toString();
+    }
+
+    private static boolean isClickHouseNonNullableContainer(Type type)
+    {
+        // ClickHouse rejects Nullable(Array(...)) and Nullable(Map(...)); these types represent absence as an empty container.
+        return type instanceof ArrayType || type instanceof MapType;
+    }
+
+    private String clickHouseElementDataType(ConnectorSession session, Type elementType)
+    {
+        // Trino array elements and map values are nullable. Wrap the ClickHouse type in Nullable when it can be (scalars);
+        // nested Array/Map cannot be inside Nullable, so they are emitted bare.
+        String dataType = toWriteMapping(session, elementType).getDataType();
+        if (isClickHouseNonNullableContainer(elementType)) {
+            return dataType;
+        }
+        return format("Nullable(%s)", dataType);
     }
 
     @Override
@@ -616,8 +660,73 @@ public class ClickHouseClient
     @Override
     public OptionalLong delete(ConnectorSession session, JdbcTableHandle handle)
     {
-        // ClickHouse does not support DELETE syntax, but is using custom: ALTER TABLE [db.]table [ON CLUSTER cluster] DELETE WHERE filter_expr
-        throw new TrinoException(NOT_SUPPORTED, MODIFYING_ROWS_MESSAGE);
+        // Modern ClickHouse (>= 22.8) executes a standard "DELETE FROM <table> WHERE <predicate>" as a synchronous
+        // lightweight delete on MergeTree-family engines (rejected on Log, so deleted-from tables must be MergeTree).
+        // Two ClickHouse-specific adaptations vs. the base JDBC delete:
+        //  1. ClickHouse does not report the affected-row count (executeUpdate always returns 0), so the count is
+        //     obtained with a matching "SELECT count(*) ... WHERE <predicate>" evaluated before the delete.
+        //  2. ClickHouse requires a WHERE clause; an unconstrained full-table delete is executed as TRUNCATE.
+        checkArgument(handle.isNamedRelation(), "Unable to delete from synthetic table: %s", handle);
+        checkArgument(handle.getLimit().isEmpty(), "Unable to delete when limit is set: %s", handle);
+        checkArgument(handle.getSortOrder().isEmpty(), "Unable to delete when sort order is set: %s", handle);
+        checkArgument(handle.getUpdateAssignments().isEmpty(), "Unable to delete when update assignments are set: %s", handle);
+
+        if (handle.getConstraint().isAll() && handle.getConstraintExpressions().isEmpty()) {
+            try (Connection connection = connectionFactory.openConnection(session)) {
+                long rowCount = countRows(session, connection, handle);
+                truncateTable(session, handle);
+                return OptionalLong.of(rowCount);
+            }
+            catch (SQLException e) {
+                throw new TrinoException(JDBC_ERROR, e);
+            }
+        }
+
+        try (Connection connection = connectionFactory.openConnection(session)) {
+            verify(connection.getAutoCommit());
+            PreparedQuery preparedQuery = queryBuilder.prepareDeleteQuery(
+                    this,
+                    session,
+                    connection,
+                    handle.getRequiredNamedRelation(),
+                    handle.getConstraint(),
+                    getAdditionalPredicate(handle.getConstraintExpressions(), Optional.empty()));
+            // ClickHouse returns 0 affected rows for a delete, so count the matching rows with the same predicate first.
+            long rowCount = countRows(session, connection, preparedQuery);
+            try (PreparedStatement statement = queryBuilder.prepareStatement(this, session, connection, preparedQuery, Optional.empty())) {
+                statement.executeUpdate();
+            }
+            return OptionalLong.of(rowCount);
+        }
+        catch (SQLException e) {
+            throw new TrinoException(JDBC_ERROR, e);
+        }
+    }
+
+    private long countRows(ConnectorSession session, Connection connection, JdbcTableHandle handle)
+            throws SQLException
+    {
+        PreparedQuery deleteQuery = queryBuilder.prepareDeleteQuery(
+                this,
+                session,
+                connection,
+                handle.getRequiredNamedRelation(),
+                handle.getConstraint(),
+                getAdditionalPredicate(handle.getConstraintExpressions(), Optional.empty()));
+        return countRows(session, connection, deleteQuery);
+    }
+
+    private long countRows(ConnectorSession session, Connection connection, PreparedQuery deleteQuery)
+            throws SQLException
+    {
+        // Rewrite "DELETE FROM <relation> [WHERE ...]" into "SELECT count(*) FROM <relation> [WHERE ...]", reusing the
+        // exact relation, predicate and bound parameters that the delete will apply.
+        PreparedQuery countQuery = deleteQuery.transformQuery(sql -> "SELECT count(*) FROM " + sql.substring("DELETE FROM ".length()));
+        try (PreparedStatement statement = queryBuilder.prepareStatement(this, session, connection, countQuery, Optional.empty());
+                ResultSet resultSet = statement.executeQuery()) {
+            resultSet.next();
+            return resultSet.getLong(1);
+        }
     }
 
     @Override
@@ -667,6 +776,8 @@ public class ClickHouseClient
                 yield Optional.of(varbinaryColumnMapping());
             }
             case UUID -> Optional.of(uuidColumnMapping());
+            case Array -> arrayColumnMapping(session, connection, column);
+            case Map -> mapColumnMapping(session, connection, column);
             default -> Optional.empty();
         };
         if (clickHouseDataTypeMapping.isPresent()) {
@@ -727,8 +838,10 @@ public class ClickHouseClient
                             timestampReadFunction(TIMESTAMP_SECONDS),
                             timestampSecondsWriteFunction(version)));
                 }
-                // TODO (https://github.com/trinodb/trino/issues/10537) Add support for Datetime64 type
-                yield Optional.of(timestampColumnMapping(TIMESTAMP_MILLIS));
+                // ClickHouse DateTime64(scale) preserves sub-second precision; map it to TIMESTAMP with the same precision.
+                int precision = column.getScale();
+                verify(precision >= 0 && precision <= MAX_CLICKHOUSE_DATETIME64_SCALE, "Unexpected DateTime64 scale: %s", precision);
+                yield Optional.of(timestampColumnMapping(createTimestampType(precision)));
             }
             case Types.TIMESTAMP_WITH_TIMEZONE -> {
                 if (columnDataType == ClickHouseDataType.DateTime) {
@@ -751,6 +864,179 @@ public class ClickHouseClient
                 yield Optional.empty();
             }
         };
+    }
+
+    private Optional<ColumnMapping> arrayColumnMapping(ConnectorSession session, Connection connection, ClickHouseColumn arrayColumn)
+    {
+        ClickHouseColumn elementColumn = arrayColumn.getArrayBaseColumn();
+        // ClickHouseDataType.getVendorTypeNumber() is a ClickHouse-internal code, not a java.sql.Types value;
+        // JdbcUtils.convertToSqlType maps the element type to the JDBC type the recursive mapping expects.
+        JdbcTypeHandle elementTypeHandle = new JdbcTypeHandle(
+                JdbcUtils.convertToSqlType(elementColumn.getDataType()).getVendorTypeNumber(),
+                Optional.of(elementColumn.getOriginalTypeName()),
+                Optional.of(elementColumn.getPrecision()),
+                Optional.of(elementColumn.getScale()),
+                Optional.empty(),
+                Optional.empty());
+        return toColumnMapping(session, connection, elementTypeHandle)
+                .map(elementMapping -> {
+                    ArrayType arrayType = new ArrayType(elementMapping.getType());
+                    return ColumnMapping.objectMapping(
+                            arrayType,
+                            arrayReadFunction(arrayType.getElementType()),
+                            arrayWriteFunction(arrayType.getElementType()));
+                });
+    }
+
+    private static ObjectReadFunction arrayReadFunction(Type elementType)
+    {
+        // The clickhouse-jdbc 0.9.x ClickHouseArray does not implement java.sql.Array.getResultSet(), so the values are
+        // read from the Java array returned by getArray(). That array may be a primitive array (e.g. long[] for
+        // Array(Int64)) or an Object[] (e.g. for nullable or String elements), so it is iterated reflectively.
+        return ObjectReadFunction.of(Block.class, (resultSet, columnIndex) -> {
+            Object elements = resultSet.getArray(columnIndex).getArray();
+            int length = java.lang.reflect.Array.getLength(elements);
+            BlockBuilder builder = elementType.createBlockBuilder(null, length);
+            for (int i = 0; i < length; i++) {
+                appendArrayElement(elementType, builder, java.lang.reflect.Array.get(elements, i));
+            }
+            return builder.build();
+        });
+    }
+
+    private static void appendArrayElement(Type elementType, BlockBuilder builder, Object element)
+    {
+        if (element == null) {
+            builder.appendNull();
+        }
+        else {
+            writeNativeValue(elementType, builder, toTrinoArrayElement(elementType, element));
+        }
+    }
+
+    private static Object toTrinoArrayElement(Type elementType, Object element)
+    {
+        if (elementType instanceof VarcharType || elementType instanceof CharType) {
+            return element instanceof byte[] bytes ? wrappedBuffer(bytes) : utf8Slice((String) element);
+        }
+        if (elementType instanceof VarbinaryType) {
+            return wrappedBuffer((byte[]) element);
+        }
+        if (elementType == REAL) {
+            return (long) floatToRawIntBits(((Number) element).floatValue());
+        }
+        if (elementType == TINYINT || elementType == SMALLINT || elementType == INTEGER || elementType == BIGINT) {
+            return ((Number) element).longValue();
+        }
+        if (elementType == BOOLEAN || elementType == DOUBLE) {
+            return element;
+        }
+        // Decimal, timestamp, date and nested array/map elements are already in their native representation, written via writeNativeValue.
+        return element;
+    }
+
+    private static ObjectWriteFunction arrayWriteFunction(Type elementType)
+    {
+        return ObjectWriteFunction.of(Block.class, (statement, index, block) -> {
+            List<Object> values = new ArrayList<>(block.getPositionCount());
+            for (int position = 0; position < block.getPositionCount(); position++) {
+                values.add(elementType.getObjectValue(block, position));
+            }
+            statement.setObject(index, values);
+        });
+    }
+
+    private Optional<ColumnMapping> mapColumnMapping(ConnectorSession session, Connection connection, ClickHouseColumn mapColumn)
+    {
+        ClickHouseColumn keyColumn = mapColumn.getKeyInfo();
+        ClickHouseColumn valueColumn = mapColumn.getValueInfo();
+        Optional<ColumnMapping> keyMapping = toColumnMapping(session, connection, mapElementTypeHandle(keyColumn));
+        Optional<ColumnMapping> valueMapping = toColumnMapping(session, connection, mapElementTypeHandle(valueColumn));
+        if (keyMapping.isEmpty() || valueMapping.isEmpty()) {
+            return Optional.empty();
+        }
+        MapType mapType = new MapType(keyMapping.get().getType(), valueMapping.get().getType(), typeOperators);
+        return Optional.of(ColumnMapping.objectMapping(mapType, mapReadFunction(mapType), mapWriteFunction(mapType)));
+    }
+
+    private static JdbcTypeHandle mapElementTypeHandle(ClickHouseColumn column)
+    {
+        // See arrayColumnMapping: convertToSqlType maps the ClickHouse type to the java.sql.Types the recursion expects.
+        return new JdbcTypeHandle(
+                JdbcUtils.convertToSqlType(column.getDataType()).getVendorTypeNumber(),
+                Optional.of(column.getOriginalTypeName()),
+                Optional.of(column.getPrecision()),
+                Optional.of(column.getScale()),
+                Optional.empty(),
+                Optional.empty());
+    }
+
+    private static ObjectReadFunction mapReadFunction(MapType mapType)
+    {
+        Type keyType = mapType.getKeyType();
+        Type valueType = mapType.getValueType();
+        // The clickhouse-jdbc driver returns a Map column as a java.util.Map; build the Trino map block from its entries.
+        return ObjectReadFunction.of(SqlMap.class, (resultSet, columnIndex) -> {
+            Map<?, ?> map = (Map<?, ?>) resultSet.getObject(columnIndex);
+            BlockBuilder blockBuilder = mapType.createBlockBuilder(null, 1);
+            ((MapBlockBuilder) blockBuilder).buildEntry((keyBuilder, valueBuilder) -> {
+                for (Map.Entry<?, ?> entry : map.entrySet()) {
+                    writeNativeValue(keyType, keyBuilder, toTrinoMapElement(keyType, entry.getKey()));
+                    if (entry.getValue() == null) {
+                        valueBuilder.appendNull();
+                    }
+                    else {
+                        writeNativeValue(valueType, valueBuilder, toTrinoMapElement(valueType, entry.getValue()));
+                    }
+                }
+            });
+            return mapType.getObject(blockBuilder.build(), 0);
+        });
+    }
+
+    private static Object toTrinoMapElement(Type type, Object value)
+    {
+        if (type instanceof ArrayType arrayType) {
+            // Nested array values (e.g. multimap Map(K, Array(V))) come back from the driver either as a primitive
+            // array (e.g. long[]) or a java.util.List, depending on the element type; handle both reflectively.
+            Type elementType = arrayType.getElementType();
+            if (value instanceof List<?> list) {
+                BlockBuilder builder = elementType.createBlockBuilder(null, list.size());
+                for (Object element : list) {
+                    appendArrayElement(elementType, builder, element);
+                }
+                return builder.build();
+            }
+            int length = java.lang.reflect.Array.getLength(value);
+            BlockBuilder builder = elementType.createBlockBuilder(null, length);
+            for (int i = 0; i < length; i++) {
+                appendArrayElement(elementType, builder, java.lang.reflect.Array.get(value, i));
+            }
+            return builder.build();
+        }
+        return toTrinoArrayElement(type, value);
+    }
+
+    private static ObjectWriteFunction mapWriteFunction(MapType mapType)
+    {
+        Type keyType = mapType.getKeyType();
+        Type valueType = mapType.getValueType();
+        return ObjectWriteFunction.of(SqlMap.class, (statement, index, sqlMap) -> {
+            int rawOffset = sqlMap.getRawOffset();
+            Block keyBlock = sqlMap.getRawKeyBlock();
+            Block valueBlock = sqlMap.getRawValueBlock();
+            Map<Object, Object> map = new LinkedHashMap<>(sqlMap.getSize());
+            for (int i = 0; i < sqlMap.getSize(); i++) {
+                map.put(keyType.getObjectValue(keyBlock, rawOffset + i), valueType.getObjectValue(valueBlock, rawOffset + i));
+            }
+            statement.setObject(index, map);
+        });
+    }
+
+    private static SliceWriteFunction jsonWriteFunction()
+    {
+        // Trino JSON is canonical JSON text; it is written verbatim into a ClickHouse String column.
+        return (statement, index, value) -> statement.setString(index, value.toStringUtf8());
     }
 
     @Override
@@ -798,8 +1084,38 @@ public class ClickHouseClient
         if (type == TIMESTAMP_SECONDS) {
             return WriteMapping.longMapping("DateTime", timestampSecondsWriteFunction(getClickHouseServerVersion(session)));
         }
+        if (type instanceof TimestampType timestampType) {
+            verify(timestampType.getPrecision() > 0 && timestampType.getPrecision() <= MAX_CLICKHOUSE_DATETIME64_SCALE, "Unexpected timestamp precision: %s", timestampType.getPrecision());
+            String dataType = format("DateTime64(%s)", timestampType.getPrecision());
+            if (timestampType.isShort()) {
+                return WriteMapping.longMapping(dataType, timestampWriteFunction(timestampType));
+            }
+            return WriteMapping.objectMapping(dataType, longTimestampWriteFunction(timestampType, timestampType.getPrecision()));
+        }
         if (type.equals(uuidType)) {
             return WriteMapping.sliceMapping("UUID", uuidWriteFunction());
+        }
+        if (type.equals(jsonType)) {
+            // Trino JSON is serialized text. It is stored in a ClickHouse String column (queryable via JSONExtract*()).
+            // ClickHouse's native JSON type is NOT used: the connector inserts via RowBinary, and clickhouse-jdbc 0.9.8
+            // cannot binary-encode a String into a native JSON column (CANNOT_READ_ALL_DATA). A String column accepts
+            // the JSON text bytes over RowBinary and keeps diamond models as pure SELECT *.
+            return WriteMapping.sliceMapping("String", jsonWriteFunction());
+        }
+        if (type instanceof ArrayType arrayType) {
+            // Trino array elements are nullable, so the ClickHouse element type is wrapped in Nullable when it can be
+            // (scalars). Nested containers (Array/Map) cannot be inside Nullable and are emitted bare.
+            String elementDataType = clickHouseElementDataType(session, arrayType.getElementType());
+            return WriteMapping.objectMapping(
+                    format("Array(%s)", elementDataType),
+                    arrayWriteFunction(arrayType.getElementType()));
+        }
+        if (type instanceof MapType mapType) {
+            // ClickHouse Map keys must NOT be Nullable; values are nullable in Trino, so they are wrapped in Nullable
+            // when possible (scalars) and left bare for nested containers (e.g. Array, for multimaps).
+            String keyDataType = toWriteMapping(session, mapType.getKeyType()).getDataType();
+            String valueDataType = clickHouseElementDataType(session, mapType.getValueType());
+            return WriteMapping.objectMapping(format("Map(%s, %s)", keyDataType, valueDataType), mapWriteFunction(mapType));
         }
         throw new TrinoException(NOT_SUPPORTED, "Unsupported column type: " + type);
     }
