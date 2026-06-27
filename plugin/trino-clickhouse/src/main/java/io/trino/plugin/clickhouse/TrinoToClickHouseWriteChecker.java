@@ -68,6 +68,13 @@ public class TrinoToClickHouseWriteChecker<T>
                     new TimestampWriteValueChecker(
                             version -> version.isNewerOrEqualTo("21.4"),
                             new Range<>(LocalDateTime.parse("1970-01-01T00:00:00"), LocalDateTime.parse("2106-02-07T06:28:15")))));
+    // DateTime64 spans [1900-01-01 00:00:00, 2299-12-31 23:59:59.999999999]. Out-of-range values are silently clamped
+    // by ClickHouse (e.g. 1899 -> 1900, 2300 -> 2299), so the value is validated before writing to surface a clear error.
+    public static final TrinoToClickHouseWriteChecker<LocalDateTime> DATETIME64 = new TrinoToClickHouseWriteChecker<>(
+            ImmutableList.of(
+                    new TimestampWriteValueChecker(
+                            alwaysTrue(),
+                            new Range<>(LocalDateTime.parse("1900-01-01T00:00:00"), LocalDateTime.parse("2299-12-31T23:59:59.999999999")))));
 
     private final List<Checker<T>> checkers;
 
