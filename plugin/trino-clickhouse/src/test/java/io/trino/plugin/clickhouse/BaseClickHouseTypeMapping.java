@@ -1011,6 +1011,24 @@ public abstract class BaseClickHouseTypeMapping
     }
 
     @Test
+    public void testUnsupportedDateTime64()
+    {
+        // ClickHouse silently clamps DateTime64 values outside [1900-01-01, 2299-12-31] (e.g. 1899 -> 1900), so the
+        // connector rejects them with a clear error instead of writing a corrupted value.
+        testUnsupportedDateTime64("1899-12-31 23:59:59.999999"); // before min
+        testUnsupportedDateTime64("2300-01-01 00:00:00.000000"); // after max
+    }
+
+    private void testUnsupportedDateTime64(String unsupportedTimestamp)
+    {
+        try (TestTable table = newTrinoTable("test_unsupported_datetime64", "(ts timestamp(6))")) {
+            assertQueryFails(
+                    format("INSERT INTO %s VALUES (TIMESTAMP '%s')", table.getName(), unsupportedTimestamp),
+                    "Timestamp must be between .* in ClickHouse:.*");
+        }
+    }
+
+    @Test
     public void testClickHouseArrayInteger()
     {
         // SqlDataTypeTest cannot be used for arrays: its verification compares the column with an array literal via "=",
