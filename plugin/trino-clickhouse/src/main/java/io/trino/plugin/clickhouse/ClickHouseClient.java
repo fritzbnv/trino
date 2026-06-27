@@ -40,6 +40,8 @@ import io.trino.plugin.jdbc.ColumnMapping;
 import io.trino.plugin.jdbc.ConnectionFactory;
 import io.trino.plugin.jdbc.JdbcColumnHandle;
 import io.trino.plugin.jdbc.JdbcExpression;
+import io.trino.plugin.jdbc.JdbcMergeTableHandle;
+import io.trino.plugin.jdbc.JdbcOutputTableHandle;
 import io.trino.plugin.jdbc.JdbcSortItem;
 import io.trino.plugin.jdbc.JdbcTableHandle;
 import io.trino.plugin.jdbc.JdbcTypeHandle;
@@ -75,6 +77,8 @@ import io.trino.spi.connector.ColumnMetadata;
 import io.trino.spi.connector.ColumnPosition;
 import io.trino.spi.connector.ConnectorSession;
 import io.trino.spi.connector.ConnectorTableMetadata;
+import io.trino.spi.connector.RetryMode;
+import io.trino.spi.connector.SchemaTableName;
 import io.trino.spi.expression.ConnectorExpression;
 import io.trino.spi.expression.Variable;
 import io.trino.spi.type.ArrayType;
@@ -121,10 +125,12 @@ import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Optional;
 import java.util.OptionalLong;
+import java.util.Set;
 import java.util.TimeZone;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiFunction;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
 import static com.clickhouse.data.ClickHouseUtils.escape;
@@ -423,7 +429,7 @@ public class ClickHouseClient
         Map<String, Object> tableProperties = tableMetadata.getProperties();
         ClickHouseEngineType engine = ClickHouseTableProperties.getEngine(tableProperties);
         tableOptions.add("ENGINE = " + engine.getEngineType());
-        if (engine == ClickHouseEngineType.MERGETREE && formatProperty(ClickHouseTableProperties.getOrderBy(tableProperties)).isEmpty()) {
+        if (engine.isMergeTreeFamily() && formatProperty(ClickHouseTableProperties.getOrderBy(tableProperties)).isEmpty()) {
             // https://clickhouse.com/docs/en/engines/table-engines/mergetree-family/mergetree#order_by
             tableOptions.add("ORDER BY tuple()");
         }
@@ -742,6 +748,55 @@ public class ClickHouseClient
     public OptionalLong update(ConnectorSession session, JdbcTableHandle handle)
     {
         throw new TrinoException(NOT_SUPPORTED, MODIFYING_ROWS_MESSAGE);
+    }
+
+    @Override
+    public boolean supportsMerge()
+    {
+        // MERGE is implemented as INSERT-only against a ReplacingMergeTree target (see ClickHouseMergeSink): every
+        // changed or new row is re-inserted and ClickHouse collapses duplicates by ORDER BY key on background merge,
+        // so the diamond serving layer never performs row-level UPDATE/DELETE mutations. The target table must be
+        // ReplacingMergeTree with its ORDER BY equal to the merge keys for dedup to be correct; that is configured by
+        // the dbt model (engine='ReplacingMergeTree', order_by=<unique_key>).
+        return true;
+    }
+
+    @Override
+    public JdbcMergeTableHandle beginMerge(
+            ConnectorSession session,
+            JdbcTableHandle handle,
+            Map<Integer, Collection<ColumnHandle>> updateColumnHandles,
+            Consumer<Runnable> rollbackActionCollector,
+            RetryMode retryMode)
+    {
+        // Unlike the base JDBC merge (which deletes/updates rows by primary key) this implementation only ever inserts,
+        // so it needs neither primary-key metadata (ClickHouse does not report any) nor delete/update output handles.
+        // It pairs with RowChangeParadigm.DELETE_ROW_AND_INSERT_ROW (see ClickHouseMetadata): the engine turns every
+        // matched-update into a delete-row + a full insert-row, and ClickHouseMergeSink keeps only the insert rows.
+        SchemaTableName schemaTableName = handle.getRequiredNamedRelation().getSchemaTableName();
+        RemoteTableName remoteTableName = handle.getRequiredNamedRelation().getRemoteTableName();
+        List<JdbcColumnHandle> columns = getColumns(session, schemaTableName, remoteTableName);
+
+        JdbcTableHandle plainTable = new JdbcTableHandle(schemaTableName, remoteTableName, Optional.empty());
+        JdbcOutputTableHandle outputTableHandle = beginInsertTable(session, plainTable, columns);
+        rollbackActionCollector.accept(() -> rollbackTemporaryTableCreation(session, outputTableHandle));
+
+        return new JdbcMergeTableHandle(
+                handle,
+                outputTableHandle,
+                ImmutableMap.of(),
+                Optional.empty(),
+                ImmutableList.of(),
+                columns,
+                ImmutableMap.of());
+    }
+
+    @Override
+    public void finishMerge(ConnectorSession session, JdbcMergeTableHandle handle, Set<Long> pageSinkIds)
+    {
+        // The insert rows were appended to the target table directly by ClickHouseMergeSink; there is no temporary
+        // table to swap in, so completing the underlying insert is all that is required.
+        finishInsertTable(session, handle.getOutputTableHandle(), pageSinkIds);
     }
 
     @Override

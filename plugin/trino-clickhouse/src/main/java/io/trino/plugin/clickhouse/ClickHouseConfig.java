@@ -22,6 +22,7 @@ public class ClickHouseConfig
 {
     // TODO (https://github.com/trinodb/trino/issues/7102) reconsider default behavior
     private boolean mapStringAsVarchar;
+    private boolean useFinal;
 
     public boolean isMapStringAsVarchar()
     {
@@ -33,6 +34,19 @@ public class ClickHouseConfig
     public ClickHouseConfig setMapStringAsVarchar(boolean mapStringAsVarchar)
     {
         this.mapStringAsVarchar = mapStringAsVarchar;
+        return this;
+    }
+
+    public boolean isUseFinal()
+    {
+        return useFinal;
+    }
+
+    @Config("clickhouse.use-final")
+    @ConfigDescription("Read MergeTree-family tables with the FINAL modifier so engines like ReplacingMergeTree return deduplicated rows before background merge completes")
+    public ClickHouseConfig setUseFinal(boolean useFinal)
+    {
+        this.useFinal = useFinal;
         return this;
     }
 }

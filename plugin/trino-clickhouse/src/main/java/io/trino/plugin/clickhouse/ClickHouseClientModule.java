@@ -28,8 +28,12 @@ import io.trino.plugin.jdbc.DriverConnectionFactory;
 import io.trino.plugin.jdbc.ForBaseJdbc;
 import io.trino.plugin.jdbc.JdbcClient;
 import io.trino.plugin.jdbc.JdbcMetadataConfig;
+import io.trino.plugin.jdbc.JdbcMetadataFactory;
+import io.trino.plugin.jdbc.QueryBuilder;
 import io.trino.plugin.jdbc.credential.CredentialProvider;
 import io.trino.plugin.jdbc.ptf.Query;
+import io.trino.spi.connector.ConnectorPageSinkProvider;
+import io.trino.spi.connector.ConnectorPageSourceProvider;
 import io.trino.spi.function.table.ConnectorTableFunction;
 
 import java.util.Properties;
@@ -37,6 +41,7 @@ import java.util.Properties;
 import static com.clickhouse.client.config.ClickHouseClientOption.USE_BINARY_STRING;
 import static com.clickhouse.jdbc.JdbcConfig.PROP_EXTERNAL_DATABASE;
 import static com.google.inject.multibindings.Multibinder.newSetBinder;
+import static com.google.inject.multibindings.OptionalBinder.newOptionalBinder;
 import static io.airlift.configuration.ConfigBinder.configBinder;
 import static io.trino.plugin.clickhouse.ClickHouseClient.DEFAULT_DOMAIN_COMPACTION_THRESHOLD;
 import static io.trino.plugin.jdbc.JdbcModule.bindSessionPropertiesProvider;
@@ -54,6 +59,14 @@ public class ClickHouseClientModule
         bindTablePropertiesProvider(binder, ClickHouseTableProperties.class);
         configBinder(binder).bindConfigDefaults(JdbcMetadataConfig.class, config -> config.setDomainCompactionThreshold(DEFAULT_DOMAIN_COMPACTION_THRESHOLD));
         binder.install(new DecimalModule());
+        // MERGE support: ClickHouseMetadata reports DELETE_ROW_AND_INSERT_ROW, ClickHousePageSourceProvider builds the
+        // all-columns $merge_row_id (ClickHouse has no JDBC primary keys), and ClickHousePageSinkProvider supplies an
+        // INSERT-only merge sink targeting ReplacingMergeTree (see ClickHouseMergeSink).
+        newOptionalBinder(binder, JdbcMetadataFactory.class).setBinding().to(ClickHouseMetadataFactory.class).in(Scopes.SINGLETON);
+        newOptionalBinder(binder, ConnectorPageSinkProvider.class).setBinding().to(ClickHousePageSinkProvider.class).in(Scopes.SINGLETON);
+        newOptionalBinder(binder, ConnectorPageSourceProvider.class).setBinding().to(ClickHousePageSourceProvider.class).in(Scopes.SINGLETON);
+        // Read MergeTree-family tables with FINAL when use_final is enabled (deduped ReplacingMergeTree reads).
+        newOptionalBinder(binder, QueryBuilder.class).setBinding().to(ClickHouseQueryBuilder.class).in(Scopes.SINGLETON);
         newSetBinder(binder, ConnectorTableFunction.class).addBinding().toProvider(Query.class).in(Scopes.SINGLETON);
     }
 
