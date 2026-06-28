@@ -489,6 +489,45 @@ public class ClickHouseClient
         }
     }
 
+    /**
+     * Whether the given table's engine supports the {@code FINAL} read modifier. FINAL is valid for the MergeTree
+     * variants that collapse rows on merge (Replacing/Aggregating/Summing/Collapsing/VersionedCollapsing, including
+     * their Replicated/Shared forms) but NOT for a plain {@code MergeTree} (ClickHouse rejects it with
+     * "Storage MergeTree doesn't support FINAL"). Used by {@link ClickHouseQueryBuilder} to add FINAL only where it is
+     * legal when {@code use_final} is enabled, so the catalog can still read plain-MergeTree (and Log, etc.) tables.
+     */
+    public boolean tableSupportsFinal(ConnectorSession session, RemoteTableName remoteTableName)
+    {
+        try (Connection connection = connectionFactory.openConnection(session);
+                PreparedStatement statement = connection.prepareStatement(
+                        "SELECT engine FROM system.tables WHERE database = ? AND name = ?")) {
+            statement.setString(1, remoteTableName.getCatalogName().orElse(null));
+            statement.setString(2, remoteTableName.getTableName());
+            try (ResultSet resultSet = statement.executeQuery()) {
+                if (!resultSet.next()) {
+                    return false;
+                }
+                return engineSupportsFinal(resultSet.getString("engine"));
+            }
+        }
+        catch (SQLException e) {
+            throw new TrinoException(JDBC_ERROR, e);
+        }
+    }
+
+    private static boolean engineSupportsFinal(String engine)
+    {
+        if (isNullOrEmpty(engine)) {
+            return false;
+        }
+        // Strip any Replicated/Shared prefix (e.g. ReplicatedReplacingMergeTree) before classifying.
+        String normalized = engine
+                .replaceFirst("^Replicated", "")
+                .replaceFirst("^Shared", "");
+        // Plain MergeTree does not support FINAL; the collapsing variants do (they end in "MergeTree" but are not "MergeTree").
+        return normalized.endsWith("MergeTree") && !normalized.equals("MergeTree");
+    }
+
     @Override
     public void setTableProperties(ConnectorSession session, JdbcTableHandle handle, Map<String, Optional<Object>> nullableProperties)
     {
