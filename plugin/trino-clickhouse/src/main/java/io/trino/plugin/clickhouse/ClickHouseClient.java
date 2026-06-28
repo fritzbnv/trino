@@ -202,6 +202,7 @@ import static io.trino.spi.type.DateTimeEncoding.packDateTimeWithZone;
 import static io.trino.spi.type.DateTimeEncoding.unpackMillisUtc;
 import static io.trino.spi.type.DateType.DATE;
 import static io.trino.spi.type.DecimalType.createDecimalType;
+import static io.trino.spi.type.Decimals.encodeShortScaledValue;
 import static io.trino.spi.type.DoubleType.DOUBLE;
 import static io.trino.spi.type.IntegerType.INTEGER;
 import static io.trino.spi.type.RealType.REAL;
@@ -1065,7 +1066,16 @@ public class ClickHouseClient
         if (elementType == BOOLEAN || elementType == DOUBLE) {
             return element;
         }
-        // Decimal, timestamp, date and nested array/map elements are already in their native representation, written via writeNativeValue.
+        if (elementType instanceof DecimalType decimalType) {
+            // The driver returns a java.math.BigDecimal, but writeNativeValue expects Trino's native decimal encoding:
+            // an unscaled long for a short decimal, an Int128 for a long decimal.
+            BigDecimal value = ((BigDecimal) element).setScale(decimalType.getScale(), UNNECESSARY);
+            if (decimalType.isShort()) {
+                return encodeShortScaledValue(value, decimalType.getScale(), UNNECESSARY);
+            }
+            return Decimals.valueOf(value);
+        }
+        // Timestamp, date and nested array/map elements are already in their native representation, written via writeNativeValue.
         return element;
     }
 
