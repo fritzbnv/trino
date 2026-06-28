@@ -40,16 +40,18 @@ import static io.trino.plugin.clickhouse.ClickHouseSessionProperties.isUseFinal;
  * MergeTree-family engines like ReplacingMergeTree return deduplicated rows even before the background merge has
  * collapsed re-inserted versions (the diamond serving layer relies on this to read consistent upserted data).
  * <p>
- * {@code FINAL} is appended only for a plain named-table scan ({@code FROM "db"."tbl" FINAL}). Pushed-down subqueries
- * (joins, aggregations) alias their FROM as {@code (...) o} and are left untouched. Only SELECTs go through
+ * {@code FINAL} is appended only for a plain named-table scan ({@code FROM "db"."tbl" FINAL}) whose engine actually
+ * supports FINAL (the collapsing MergeTree variants — see {@link ClickHouseClient#tableSupportsFinal}); plain
+ * {@code MergeTree}, Log, etc. are left untouched because ClickHouse rejects FINAL on them. Pushed-down subqueries
+ * (joins, aggregations) alias their FROM as {@code (...) o} and are also left untouched. Only SELECTs go through
  * {@link #getFrom}; DELETE/UPDATE build their relation via {@code getRelation} and are unaffected.
  */
 public class ClickHouseQueryBuilder
         extends DefaultQueryBuilder
 {
-    // getFrom() carries no ConnectorSession, so the per-query use_final decision read in prepareSelectQuery is passed to
-    // getFrom across the same-thread call via this holder.
-    private final ThreadLocal<Boolean> useFinal = ThreadLocal.withInitial(() -> Boolean.FALSE);
+    // getFrom() carries no ConnectorSession, so the per-query session read in prepareSelectQuery is passed to getFrom
+    // across the same-thread call via this holder (used to check use_final and to look up the table engine).
+    private final ThreadLocal<ConnectorSession> currentSession = new ThreadLocal<>();
 
     @Inject
     public ClickHouseQueryBuilder(RemoteQueryModifier queryModifier)
@@ -69,12 +71,12 @@ public class ClickHouseQueryBuilder
             TupleDomain<ColumnHandle> tupleDomain,
             Optional<ParameterizedExpression> additionalPredicate)
     {
-        useFinal.set(isUseFinal(session));
+        currentSession.set(session);
         try {
             return super.prepareSelectQuery(client, session, connection, baseRelation, groupingSets, columns, columnExpressions, tupleDomain, additionalPredicate);
         }
         finally {
-            useFinal.remove();
+            currentSession.remove();
         }
     }
 
@@ -82,7 +84,12 @@ public class ClickHouseQueryBuilder
     protected String getFrom(JdbcClient client, JdbcRelationHandle baseRelation, Consumer<QueryParameter> accumulator)
     {
         String from = super.getFrom(client, baseRelation, accumulator);
-        if (useFinal.get() && baseRelation instanceof JdbcNamedRelationHandle) {
+        ConnectorSession session = currentSession.get();
+        if (session != null
+                && isUseFinal(session)
+                && baseRelation instanceof JdbcNamedRelationHandle namedRelation
+                && client instanceof ClickHouseClient clickHouseClient
+                && clickHouseClient.tableSupportsFinal(session, namedRelation.getRemoteTableName())) {
             return from + " FINAL";
         }
         return from;
