@@ -38,8 +38,6 @@ import io.trino.spi.function.table.ConnectorTableFunction;
 
 import java.util.Properties;
 
-import static com.clickhouse.client.config.ClickHouseClientOption.USE_BINARY_STRING;
-import static com.clickhouse.jdbc.JdbcConfig.PROP_EXTERNAL_DATABASE;
 import static com.google.inject.multibindings.Multibinder.newSetBinder;
 import static com.google.inject.multibindings.OptionalBinder.newOptionalBinder;
 import static io.airlift.configuration.ConfigBinder.configBinder;
@@ -47,6 +45,10 @@ import static io.trino.plugin.clickhouse.ClickHouseClient.DEFAULT_DOMAIN_COMPACT
 import static io.trino.plugin.jdbc.JdbcModule.bindSessionPropertiesProvider;
 import static io.trino.plugin.jdbc.JdbcModule.bindTablePropertiesProvider;
 
+// clickhouse-jdbc 0.9.8 deprecates its V1 API (ClickHouseClientOption, JdbcConfig, DriverV1) that this connector still
+// relies on; the deprecated calls are intentional and unavoidable while targeting that driver, so deprecation warnings
+// are suppressed.
+@SuppressWarnings("deprecation")
 public class ClickHouseClientModule
         implements Module
 {
@@ -77,12 +79,12 @@ public class ClickHouseClientModule
     {
         Properties properties = new Properties();
         // The connector expects byte array for FixedString and String types
-        properties.setProperty(USE_BINARY_STRING.getKey(), "true");
+        properties.setProperty(com.clickhouse.client.config.ClickHouseClientOption.USE_BINARY_STRING.getKey(), "true");
         // externalDatabase=false is needed because Schema listing fetch is extremely slow on Clickhouse-server 24.3+
         // https://github.com/ClickHouse/clickhouse-java/issues/1245
         // https://github.com/ClickHouse/clickhouse-java/issues/1584
         // in Clickhouse itself it has been left `true` by default only for backward compatibility.
-        properties.setProperty(PROP_EXTERNAL_DATABASE, "false");
+        properties.setProperty(com.clickhouse.jdbc.JdbcConfig.PROP_EXTERNAL_DATABASE, "false");
         return new ClickHouseConnectionFactory(DriverConnectionFactory.builder(new DriverV1(), config.getConnectionUrl(), credentialProvider)
                 .setConnectionProperties(properties)
                 .setOpenTelemetry(openTelemetry)

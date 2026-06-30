@@ -1314,7 +1314,9 @@ public class TestClickHouseConnectorTest
     // upsert, so those operations behave differently here and the relevant base tests are overridden below.
 
     @Test
-    @Override // MERGE is supported (insert-only upsert), so the WHEN NOT MATCHED INSERT in this declaration check succeeds.
+    // MERGE is supported (insert-only upsert), so the WHEN NOT MATCHED INSERT in this declaration check succeeds.
+    // Note: the 478 BaseConnectorTest has no verifySupportsMergeDeclaration to override (it was added in a later
+    // release), so this is a standalone test rather than an @Override.
     public void verifySupportsMergeDeclaration()
     {
         try (TestTable table = newTrinoTable("test_supports_merge", "(key int NOT NULL, data varchar) WITH (engine = 'ReplacingMergeTree', order_by = ARRAY['key'])")) {

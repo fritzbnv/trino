@@ -23,10 +23,7 @@ import io.trino.spi.connector.ConnectorMergeSink;
 import io.trino.spi.connector.ConnectorMergeTableHandle;
 import io.trino.spi.connector.ConnectorPageSinkId;
 import io.trino.spi.connector.ConnectorSession;
-import io.trino.spi.connector.ConnectorTableCredentials;
 import io.trino.spi.connector.ConnectorTransactionHandle;
-
-import java.util.Optional;
 
 import static java.util.Objects.requireNonNull;
 
@@ -53,7 +50,6 @@ public class ClickHousePageSinkProvider
             ConnectorTransactionHandle transactionHandle,
             ConnectorSession session,
             ConnectorMergeTableHandle mergeHandle,
-            Optional<ConnectorTableCredentials> tableCredentials,
             ConnectorPageSinkId pageSinkId)
     {
         return new ClickHouseMergeSink(session, (JdbcMergeTableHandle) mergeHandle, jdbcClient, pageSinkId, queryModifier);

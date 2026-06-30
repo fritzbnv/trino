@@ -31,6 +31,9 @@ import static io.trino.spi.StandardErrorCode.INVALID_ARGUMENTS;
 import static java.lang.String.format;
 import static java.util.Objects.requireNonNull;
 
+// clickhouse-jdbc 0.9.8 deprecates ClickHouseVersion, which this version range checker still relies on; the deprecated
+// calls are intentional and unavoidable while targeting that driver, so deprecation warnings are suppressed.
+@SuppressWarnings("deprecation")
 public class TrinoToClickHouseWriteChecker<T>
 {
     // Different versions of ClickHouse may support different min/max values for the

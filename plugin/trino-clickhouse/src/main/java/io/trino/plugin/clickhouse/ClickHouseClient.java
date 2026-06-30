@@ -130,7 +130,6 @@ import java.util.TimeZone;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiFunction;
-import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
 import static com.clickhouse.data.ClickHouseUtils.escape;
@@ -234,6 +233,9 @@ import static java.util.Locale.ENGLISH;
 import static java.util.Objects.requireNonNull;
 import static java.util.stream.Collectors.joining;
 
+// clickhouse-jdbc 0.9.8 deprecates its V1 API (e.g. ClickHouseVersion) that this connector still relies on; the
+// deprecated calls are intentional and unavoidable while targeting that driver, so deprecation warnings are suppressed.
+@SuppressWarnings("deprecation")
 public class ClickHouseClient
         extends BaseJdbcClient
 {
@@ -808,7 +810,7 @@ public class ClickHouseClient
             ConnectorSession session,
             JdbcTableHandle handle,
             Map<Integer, Collection<ColumnHandle>> updateColumnHandles,
-            Consumer<Runnable> rollbackActionCollector,
+            List<Runnable> rollbackActions,
             RetryMode retryMode)
     {
         // Unlike the base JDBC merge (which deletes/updates rows by primary key) this implementation only ever inserts,
@@ -821,7 +823,7 @@ public class ClickHouseClient
 
         JdbcTableHandle plainTable = new JdbcTableHandle(schemaTableName, remoteTableName, Optional.empty());
         JdbcOutputTableHandle outputTableHandle = beginInsertTable(session, plainTable, columns);
-        rollbackActionCollector.accept(() -> rollbackTemporaryTableCreation(session, outputTableHandle));
+        rollbackActions.add(() -> rollbackCreateTable(session, outputTableHandle));
 
         return new JdbcMergeTableHandle(
                 handle,
