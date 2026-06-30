@@ -1055,7 +1055,9 @@ public class ClickHouseClient
             return element instanceof byte[] bytes ? wrappedBuffer(bytes) : utf8Slice((String) element);
         }
         if (elementType instanceof VarbinaryType) {
-            return wrappedBuffer((byte[]) element);
+            // ClickHouse String maps to Trino varbinary, but the driver returns String column
+            // values as java.lang.String (not byte[]) inside arrays/maps; handle both forms.
+            return element instanceof byte[] bytes ? wrappedBuffer(bytes) : utf8Slice((String) element);
         }
         if (elementType == REAL) {
             return (long) floatToRawIntBits(((Number) element).floatValue());
