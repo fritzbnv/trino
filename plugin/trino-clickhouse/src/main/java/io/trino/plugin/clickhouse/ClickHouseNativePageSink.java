@@ -42,6 +42,7 @@ import io.trino.spi.type.RowType;
 import io.trino.spi.type.TimestampType;
 import io.trino.spi.type.TimestampWithTimeZoneType;
 import io.trino.spi.type.Type;
+import io.trino.spi.type.UuidType;
 import io.trino.spi.type.VarbinaryType;
 import io.trino.spi.type.VarcharType;
 
@@ -59,6 +60,7 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.time.Instant;
+import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -81,6 +83,7 @@ import static io.trino.plugin.jdbc.StandardColumnMappings.fromTrinoTimestamp;
 import static io.trino.spi.type.BigintType.BIGINT;
 import static io.trino.spi.type.BooleanType.BOOLEAN;
 import static io.trino.spi.type.DateTimeEncoding.unpackMillisUtc;
+import static io.trino.spi.type.DateType.DATE;
 import static io.trino.spi.type.DoubleType.DOUBLE;
 import static io.trino.spi.type.IntegerType.INTEGER;
 import static io.trino.spi.type.RealType.REAL;
@@ -89,6 +92,7 @@ import static io.trino.spi.type.Timestamps.MILLISECONDS_PER_SECOND;
 import static io.trino.spi.type.Timestamps.NANOSECONDS_PER_MILLISECOND;
 import static io.trino.spi.type.Timestamps.PICOSECONDS_PER_NANOSECOND;
 import static io.trino.spi.type.TinyintType.TINYINT;
+import static io.trino.spi.type.UuidType.trinoUuidToJavaUuid;
 import static java.lang.Float.intBitsToFloat;
 import static java.lang.Math.floorDiv;
 import static java.lang.Math.floorMod;
@@ -468,6 +472,16 @@ public class ClickHouseNativePageSink
             // ClickHouse String is an arbitrary byte string; write the raw bytes with a varint length prefix.
             return (out, block, position) -> BinaryStreamUtils.writeString(out, type.getSlice(block, position).getBytes());
         }
+        if (type instanceof UuidType) {
+            // Trino UUID -> ClickHouse UUID (16 bytes). Convert via the same helper the connector's uuidWriteFunction
+            // uses (trinoUuidToJavaUuid), then let BinaryStreamUtils.writeUuid apply ClickHouse's UUID byte order.
+            return (out, block, position) -> BinaryStreamUtils.writeUuid(out, trinoUuidToJavaUuid(type.getSlice(block, position)));
+        }
+        if (type == DATE) {
+            // Trino DATE stores days since epoch as an int; ClickHouse Date is days since 1970-01-01. Encode via LocalDate
+            // so BinaryStreamUtils emits the right width, matching the "Date" column getColumnDefinitionSql declares.
+            return (out, block, position) -> BinaryStreamUtils.writeDate(out, LocalDate.ofEpochDay(DATE.getInt(block, position)));
+        }
         if (type instanceof TimestampType timestampType) {
             int precision = timestampType.getPrecision();
             if (timestampType.isShort()) {
@@ -549,7 +563,7 @@ public class ClickHouseNativePageSink
                 }
             };
         }
-        // UUID, JSON, IPv4/IPv6 and other slice-mapped types are written to a ClickHouse String column by the JDBC path;
+        // JSON, IPv4/IPv6 and other slice-mapped types are written to a ClickHouse String column by the JDBC path;
         // they are outside the scope of this native sink's supported set. Fail fast rather than corrupt rows.
         throw new TrinoException(JDBC_ERROR, "ClickHouse native RowBinary sink does not support column type: " + type);
     }

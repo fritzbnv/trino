@@ -42,7 +42,8 @@ page straight into that byte stream.
 - Reuses the existing connector wholesale (types, DDL, MERGE plumbing) — small, contained change.
 
 **Cons / costs**
-- **Partial type coverage** — supports exactly the diamond type set; UUID/JSON/IP fail fast (§5.4).
+- **Partial type coverage** — covers 100% of prod gold's types (verified; §5.4), but not a full superset:
+  JSON/IP/`time` fail fast if ever introduced.
 - We now **own the RowBinary encoding** and must keep its null-flag layout byte-exact against the DDL
   (`getColumnDefinitionSql`) — a correctness burden the JDBC driver otherwise carried.
 - Depends on **Client V2** (bundled in the shaded `clickhouse-jdbc:all` jar; a driver bump must keep it).
@@ -141,8 +142,9 @@ explicitly out of scope (see §10, Non-goals).
 - **Not** native-S3 / `icebergS3()` ingest. That bypasses Trino and dbt entirely and re-implements
   incremental/merge logic; explicitly rejected (see §10).
 - **Not** physical row deletion. MERGE stays an INSERT-only upsert into a ReplacingMergeTree (see §6).
-- **Not** a full type superset. UUID/JSON/IPv4/IPv6 and other slice-mapped-to-String types are **not**
-  supported by the sink and fail fast (see §5.4). They remain writable via the JDBC path if ever needed.
+- **Not** a full type superset. The supported set covers 100% of prod gold (§5.4), but JSON/IPv4/IPv6/`time`
+  and other slice-mapped-to-String types are **not** supported and fail fast. They remain writable via the
+  JDBC path if ever needed.
 - **No changes to the read path** beyond what the type work (separate commits) already landed.
 
 ---
@@ -233,6 +235,8 @@ recursively for containers. Mapping (all via `com.clickhouse.data.format.BinaryS
 | `decimal(p,s)` | `Decimal(p,s)` | `writeDecimal` (short → from `long`; long → from `Int128.toBigInteger()`) |
 | `char`/`varchar` | `String` | `writeString(slice.getBytes())` |
 | `varbinary` | `String` | `writeString(raw bytes)` — CH `String` is an arbitrary byte string |
+| `uuid` | `UUID` | `writeUuid(trinoUuidToJavaUuid(slice))` — CH's 16-byte UUID order via the same helper as `uuidWriteFunction` |
+| `date` | `Date` | `writeDate(LocalDate.ofEpochDay(days))` |
 | `timestamp(p)` | `DateTime64(p)` | `writeDateTime64` in UTC (`fromTrinoTimestamp` / `fromLongTrinoTimestamp`) |
 | `timestamp(p) with time zone` | `DateTime64(p)` | normalize to `Instant`, `writeDateTime64` in UTC |
 | `array(T)` | `Array(T)` | `writeVarInt(count)` then each element |
@@ -257,12 +261,20 @@ does not allow `Nullable(Array(...))`, `Nullable(Map(...))`, or `Nullable(Tuple(
 always emitted bare; scalars are wrapped. **Map keys are never Nullable** (`keyEncoder` uses
 `nullable=false` unconditionally).
 
-### 5.4 Unsupported types
+### 5.4 Supported-type coverage and the unsupported tail
 
-UUID, JSON, IPv4/IPv6, and any other type the connector maps to a ClickHouse `String` via a slice are
-**out of scope**. `valueEncoder` throws `TrinoException(JDBC_ERROR, "…does not support column type: …")`
-rather than silently corrupting the positional stream. If such a column ever appears in a diamond table,
-the load fails loudly and we extend the encoder deliberately.
+**The supported set (§5.2) covers 100% of the live prod `nvmap.gold` schema** — verified by scanning
+`nvmap.information_schema.columns` (115 tables, 2778 columns, 34 distinct types): every type resolves to an
+encoder, including the complex ones (`array(row(...))`, `map(boolean, array(varchar))`,
+`map(varchar, array(bigint))` multimaps, `varbinary` WKB, `decimal(38,24)`, and — after this change —
+`date` (5 cols) and `uuid` (1 col)).
+
+JSON, IPv4/IPv6, `time`, and any other type the connector maps to a ClickHouse `String`/other via a slice
+are **still out of scope** (none appear in gold). `valueEncoder` throws
+`TrinoException(JDBC_ERROR, "…does not support column type: …")` rather than silently corrupting the
+positional stream. If such a column ever appears, the load fails loudly and we extend the encoder
+deliberately (the DATE/UUID additions are the template: one `valueEncoder` case + the matching
+`BinaryStreamUtils` writer + a round-trip test).
 
 ---
 
@@ -348,6 +360,10 @@ Cases:
    non-temp-table path).
 5. `testCreateTableAsSelectRowType` — CTAS of a `row(a integer, b varchar)` → `Tuple(...)` column, proving
    the container-is-bare rule at CTAS time.
+6. `testCreateTableAsSelectDate` — CTAS of a `date` → `Date` column with a NULL, exercising the
+   `Nullable(Date)` null-flag path (the 5 gold `date` columns).
+7. `testCreateTableAsSelectUuid` — CTAS of a `uuid` → `UUID` column, asserting byte-exact round-trip via the
+   string form (the 1 gold `uuid` column).
 
 ### 8.2 The failing-first → fixed story (TDD-style record)
 
@@ -359,7 +375,7 @@ failure taught something and is preserved here because it documents *why* the fi
 | 0 (baseline, no fix) | Whole class errors in `@BeforeAll`: `No columns found in system.columns for default.tpch.nation` while `copyTpchTables` runs its `CREATE TABLE … AS SELECT` | The connector was **unusable for any fresh-table build** — even the test fixtures couldn't load | (this is the bug we're fixing) |
 | 1 | `Code: 44 … Sorting key contains nullable columns` on all cases | Test fixture used `order_by = ARRAY['id']` with a `Nullable` key | Switch test tables to `ORDER BY tuple()` (§7.4) |
 | 2 | 3/5 cases: `Code: 60 … Table … does not exist (UNKNOWN_TABLE)` at insert time | **Facet A** — sink inserted into the final table, not the temp table | Route insert through `getTemporaryTableName().orElse(...)` (D6) |
-| 2 | `does not support column type: date` (multi-row case) | Test selected `orderdate` (DATE); the sink has no DATE encoder (out of scope) | Test change: select `orderstatus` instead of `orderdate` |
+| 2 | `does not support column type: date` (multi-row case) | Test selected `orderdate` (DATE); at the time the sink had no DATE encoder | Test change: select `orderstatus` (DATE later added as a first-class encoder — see below) |
 | 3 | `testInsertIntoExistingStillWorks`: `mismatched column types: Table [bigint, varbinary], Query [integer, varchar(1)]`; `testCreateTableAsSelectScalars`: `expected "a" but was [97]` | Connector maps CH `String` ↔ Trino `varbinary`; test assumed `varchar` round-trip | Test change: use `varbinary` literals / assert bytes (`containsExactly('a')`) — validates the *sink*, not the read mapping |
 | 4 | **all 5 pass** (`Tests run: 5, Failures: 0, Errors: 0`) | — | done |
 
@@ -566,9 +582,9 @@ number; the laptop figures should be cited only as relative, constrained-environ
 
 ## 14. Risks and open items
 
-- **Type coverage is intentionally partial (§5.4).** New diamond columns of an unsupported type fail the
-  load loudly; extend `valueEncoder` deliberately when that happens (e.g. `DATE` if a gold table needs a
-  bare date column — currently unsupported and caught by the fast-fail).
+- **Type coverage matches prod gold today (§5.4), but is not a full superset.** A future diamond column of
+  an unsupported type (JSON/IP/`time`) fails the load loudly; extend `valueEncoder` deliberately when that
+  happens (the DATE/UUID additions are the worked example).
 - **`system.columns` lookup adds one round-trip at sink open.** Negligible vs the insert, and skipped-effect
   when the fallback fires; acceptable.
 - **Client V2 lives inside the shaded `clickhouse-jdbc:all` jar (D9).** A future driver bump must keep

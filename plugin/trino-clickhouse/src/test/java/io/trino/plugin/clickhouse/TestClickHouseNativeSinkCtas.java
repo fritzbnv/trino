@@ -19,6 +19,8 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
 
+import java.time.LocalDate;
+
 import static io.trino.testing.TestingNames.randomNameSuffix;
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -148,6 +150,48 @@ final class TestClickHouseNativeSinkCtas
                     .isEqualTo(1L);
             assertThat(queryRunner.execute("SELECT r.a FROM clickhouse.tpch." + table).getOnlyValue())
                     .isEqualTo(10);
+        }
+        finally {
+            queryRunner.execute("DROP TABLE IF EXISTS clickhouse.tpch." + table);
+        }
+    }
+
+    @Test
+    void testCreateTableAsSelectDate()
+    {
+        String table = "ctas_date_" + randomNameSuffix();
+        try {
+            // DATE -> ClickHouse Date. Include a NULL to exercise the Nullable(Date) null-flag path.
+            queryRunner.execute("CREATE TABLE clickhouse.tpch." + table + " (id, d) " +
+                    "WITH (engine = 'MergeTree') AS " +
+                    "SELECT CAST(n AS bigint), CASE WHEN n = 2 THEN CAST(NULL AS date) ELSE DATE '2026-07-01' END " +
+                    "FROM (VALUES 1, 2) t(n)");
+            assertThat((long) queryRunner.execute("SELECT count(*) FROM clickhouse.tpch." + table).getOnlyValue())
+                    .isEqualTo(2L);
+            assertThat(queryRunner.execute("SELECT d FROM clickhouse.tpch." + table + " WHERE id = 1").getOnlyValue())
+                    .isEqualTo(LocalDate.of(2026, 7, 1));
+            assertThat((long) queryRunner.execute("SELECT count(*) FROM clickhouse.tpch." + table + " WHERE d IS NULL").getOnlyValue())
+                    .isEqualTo(1L);
+        }
+        finally {
+            queryRunner.execute("DROP TABLE IF EXISTS clickhouse.tpch." + table);
+        }
+    }
+
+    @Test
+    void testCreateTableAsSelectUuid()
+    {
+        String table = "ctas_uuid_" + randomNameSuffix();
+        String uuid = "12345678-1234-1234-1234-1234567890ab";
+        try {
+            // UUID -> ClickHouse UUID (16 bytes, ClickHouse byte order); must round-trip byte-exact.
+            queryRunner.execute("CREATE TABLE clickhouse.tpch." + table + " (id, u) " +
+                    "WITH (engine = 'MergeTree') AS " +
+                    "SELECT CAST(1 AS bigint), CAST('" + uuid + "' AS uuid)");
+            assertThat((long) queryRunner.execute("SELECT count(*) FROM clickhouse.tpch." + table).getOnlyValue())
+                    .isEqualTo(1L);
+            assertThat(queryRunner.execute("SELECT CAST(u AS varchar) FROM clickhouse.tpch." + table).getOnlyValue())
+                    .isEqualTo(uuid);
         }
         finally {
             queryRunner.execute("DROP TABLE IF EXISTS clickhouse.tpch." + table);
