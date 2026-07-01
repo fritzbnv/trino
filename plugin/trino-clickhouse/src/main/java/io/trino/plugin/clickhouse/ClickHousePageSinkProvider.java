@@ -14,38 +14,77 @@
 package io.trino.plugin.clickhouse;
 
 import com.google.inject.Inject;
+import io.trino.plugin.jdbc.BaseJdbcConfig;
 import io.trino.plugin.jdbc.JdbcClient;
 import io.trino.plugin.jdbc.JdbcMergeTableHandle;
+import io.trino.plugin.jdbc.JdbcOutputTableHandle;
 import io.trino.plugin.jdbc.JdbcPageSinkProvider;
 import io.trino.plugin.jdbc.QueryBuilder;
+import io.trino.plugin.jdbc.credential.CredentialProvider;
 import io.trino.plugin.jdbc.logging.RemoteQueryModifier;
+import io.trino.spi.connector.ConnectorInsertTableHandle;
 import io.trino.spi.connector.ConnectorMergeSink;
 import io.trino.spi.connector.ConnectorMergeTableHandle;
+import io.trino.spi.connector.ConnectorOutputTableHandle;
+import io.trino.spi.connector.ConnectorPageSink;
 import io.trino.spi.connector.ConnectorPageSinkId;
 import io.trino.spi.connector.ConnectorSession;
 import io.trino.spi.connector.ConnectorTableCredentials;
 import io.trino.spi.connector.ConnectorTransactionHandle;
+import io.trino.spi.security.ConnectorIdentity;
 
 import java.util.Optional;
 
 import static java.util.Objects.requireNonNull;
 
 /**
- * Reuses the default JDBC insert page sinks but supplies a ClickHouse-specific {@link ClickHouseMergeSink} (INSERT-only
- * against a ReplacingMergeTree target) for MERGE. Bound in place of the default provider by {@link ClickHouseClientModule}.
+ * Supplies ClickHouse-native write sinks in place of the default JDBC ones. INSERT/CTAS and MERGE both stream rows to
+ * ClickHouse in RowBinary via {@link ClickHouseNativePageSink} (Client V2), which is far faster than the base
+ * {@link io.trino.plugin.jdbc.JdbcPageSink}'s per-batch {@code PreparedStatement.executeBatch()}. MERGE remains an
+ * INSERT-only upsert against a ReplacingMergeTree target via {@link ClickHouseMergeSink}. Bound in place of the default
+ * provider by {@link ClickHouseClientModule}.
  */
 public class ClickHousePageSinkProvider
         extends JdbcPageSinkProvider
 {
     private final JdbcClient jdbcClient;
-    private final RemoteQueryModifier queryModifier;
+    private final String connectionUrl;
+    private final CredentialProvider credentialProvider;
 
     @Inject
-    public ClickHousePageSinkProvider(JdbcClient jdbcClient, RemoteQueryModifier remoteQueryModifier, QueryBuilder queryBuilder)
+    public ClickHousePageSinkProvider(
+            JdbcClient jdbcClient,
+            RemoteQueryModifier remoteQueryModifier,
+            QueryBuilder queryBuilder,
+            BaseJdbcConfig config,
+            CredentialProvider credentialProvider)
     {
         super(jdbcClient, remoteQueryModifier, queryBuilder);
         this.jdbcClient = requireNonNull(jdbcClient, "jdbcClient is null");
-        this.queryModifier = requireNonNull(remoteQueryModifier, "remoteQueryModifier is null");
+        this.connectionUrl = requireNonNull(config, "config is null").getConnectionUrl();
+        this.credentialProvider = requireNonNull(credentialProvider, "credentialProvider is null");
+    }
+
+    @Override
+    public ConnectorPageSink createPageSink(
+            ConnectorTransactionHandle transactionHandle,
+            ConnectorSession session,
+            ConnectorOutputTableHandle tableHandle,
+            Optional<ConnectorTableCredentials> tableCredentials,
+            ConnectorPageSinkId pageSinkId)
+    {
+        return createNativePageSink(session, (JdbcOutputTableHandle) tableHandle, pageSinkId);
+    }
+
+    @Override
+    public ConnectorPageSink createPageSink(
+            ConnectorTransactionHandle transactionHandle,
+            ConnectorSession session,
+            ConnectorInsertTableHandle tableHandle,
+            Optional<ConnectorTableCredentials> tableCredentials,
+            ConnectorPageSinkId pageSinkId)
+    {
+        return createNativePageSink(session, (JdbcOutputTableHandle) tableHandle, pageSinkId);
     }
 
     @Override
@@ -56,6 +95,20 @@ public class ClickHousePageSinkProvider
             Optional<ConnectorTableCredentials> tableCredentials,
             ConnectorPageSinkId pageSinkId)
     {
-        return new ClickHouseMergeSink(session, (JdbcMergeTableHandle) mergeHandle, jdbcClient, pageSinkId, queryModifier);
+        ClickHouseNativePageSink insertSink = createNativePageSink(session, ((JdbcMergeTableHandle) mergeHandle).getOutputTableHandle(), pageSinkId);
+        return new ClickHouseMergeSink(session, (JdbcMergeTableHandle) mergeHandle, pageSinkId, insertSink);
+    }
+
+    private ClickHouseNativePageSink createNativePageSink(ConnectorSession session, JdbcOutputTableHandle handle, ConnectorPageSinkId pageSinkId)
+    {
+        Optional<ConnectorIdentity> identity = Optional.of(session.getIdentity());
+        return new ClickHouseNativePageSink(
+                session,
+                handle,
+                jdbcClient,
+                pageSinkId,
+                connectionUrl,
+                credentialProvider.getConnectionUser(identity),
+                credentialProvider.getConnectionPassword(identity));
     }
 }

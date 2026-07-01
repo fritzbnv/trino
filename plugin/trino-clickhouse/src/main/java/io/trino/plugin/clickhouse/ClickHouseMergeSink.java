@@ -16,10 +16,7 @@ package io.trino.plugin.clickhouse;
 import com.google.common.collect.ImmutableList;
 import io.airlift.slice.Slice;
 import io.airlift.slice.Slices;
-import io.trino.plugin.jdbc.JdbcClient;
 import io.trino.plugin.jdbc.JdbcMergeTableHandle;
-import io.trino.plugin.jdbc.JdbcPageSink;
-import io.trino.plugin.jdbc.logging.RemoteQueryModifier;
 import io.trino.spi.Page;
 import io.trino.spi.TrinoException;
 import io.trino.spi.block.Block;
@@ -67,18 +64,17 @@ public class ClickHouseMergeSink
     public ClickHouseMergeSink(
             ConnectorSession session,
             JdbcMergeTableHandle mergeHandle,
-            JdbcClient jdbcClient,
             ConnectorPageSinkId pageSinkId,
-            RemoteQueryModifier queryModifier)
+            ConnectorPageSink insertSink)
     {
         requireNonNull(session, "session is null");
         requireNonNull(mergeHandle, "mergeHandle is null");
-        requireNonNull(jdbcClient, "jdbcClient is null");
-        requireNonNull(queryModifier, "queryModifier is null");
 
         this.pageSinkId = requireNonNull(pageSinkId, "pageSinkId is null");
         this.columnCount = mergeHandle.getDataColumns().size();
-        this.insertSink = new JdbcPageSink(session, mergeHandle.getOutputTableHandle(), jdbcClient, pageSinkId, queryModifier, JdbcClient::buildInsertSql);
+        // The insert sink streams the MERGE's insertion rows to the ReplacingMergeTree target via RowBinary (Client V2);
+        // ClickHouseMergeSink discards deletions and rejects explicit deletes, preserving the INSERT-only upsert semantics.
+        this.insertSink = requireNonNull(insertSink, "insertSink is null");
     }
 
     @Override
