@@ -150,13 +150,17 @@ public class ClickHouseNativePageSink
         this.includePageSinkIdColumn = handle.getPageSinkIdColumnName().isPresent();
 
         RemoteTableName remoteTableName = handle.getRemoteTableName();
+        // Match BaseJdbcClient.buildInsertSql: writes go to the temporary table when present (CREATE TABLE AS SELECT and
+        // fault-tolerant INSERT both stage into a temp table that finishInsert/finishCreateTable later renames), otherwise
+        // to the final table. Insert AND the nullability lookup must target this same table.
+        String effectiveTableName = handle.getTemporaryTableName().orElse(remoteTableName.getTableName());
 
         // Read the actual server-side column definitions so the Nullable(T) prefix matches the created table exactly.
         // RowBinary is positional, so match the target table's declared columns in insert-column order.
         List<String> columnNames = new ArrayList<>(handle.getColumnNames());
         List<Boolean> nullableFlags;
         try {
-            nullableFlags = new ArrayList<>(readColumnNullability(session, jdbcClient, handle, remoteTableName, columnNames));
+            nullableFlags = new ArrayList<>(readColumnNullability(session, jdbcClient, handle, remoteTableName, effectiveTableName, columnNames, columnTypes));
         }
         catch (SQLException e) {
             throw new TrinoException(JDBC_ERROR, "Failed to read ClickHouse column metadata for native insert: " + e.getMessage(), e);
@@ -180,8 +184,8 @@ public class ClickHouseNativePageSink
             PipedInputStream pipeSource = new PipedInputStream(PIPE_BUFFER_SIZE);
             this.pipeSink = new PipedOutputStream(pipeSource);
             String tableName = remoteTableName.getSchemaName()
-                    .map(schema -> schema + "." + remoteTableName.getTableName())
-                    .orElse(remoteTableName.getTableName());
+                    .map(schema -> schema + "." + effectiveTableName)
+                    .orElse(effectiveTableName);
             List<String> insertColumns = includePageSinkIdColumn
                     ? ImmutableList.<String>builder().addAll(columnNames).add(handle.getPageSinkIdColumnName().orElseThrow()).build()
                     : ImmutableList.copyOf(columnNames);
@@ -334,16 +338,26 @@ public class ClickHouseNativePageSink
     }
 
     /**
-     * Reads per-column nullability from {@code system.columns} for the target table (in insert-column order). A column is
-     * Nullable(T) in RowBinary exactly when its declared server type starts with {@code Nullable(}; this is the ground
-     * truth for the created-table DDL produced by {@link ClickHouseClient#getColumnDefinitionSql}.
+     * Returns per-column nullability (in insert-column order) so the RowBinary null-flag prefix matches the target
+     * table's declared columns. A column is Nullable(T) exactly when its declared server type starts with
+     * {@code Nullable(} -- the ground truth being the DDL produced by {@link ClickHouseClient#getColumnDefinitionSql},
+     * which wraps a column in {@code Nullable(...)} iff {@code column.isNullable() && !isClickHouseNonNullableContainer}.
+     * <p>
+     * The lookup targets {@code effectiveTableName} -- the temporary table for CREATE TABLE AS SELECT / fault-tolerant
+     * INSERT, else the final table (see {@code BaseJdbcClient.buildInsertSql}). When the table is not visible in
+     * {@code system.columns} (e.g. a CTAS whose temp table was created on a separate connection not yet committed), this
+     * falls back to the same rule the connector just used to emit the DDL: an output column (always nullable in Trino)
+     * is {@code Nullable(T)} when it is a scalar and bare when it is an Array/Map/Tuple container -- i.e.
+     * {@link #isNullableElement}. The same fallback covers any individual column missing from {@code system.columns}.
      */
     private static List<Boolean> readColumnNullability(
             ConnectorSession session,
             JdbcClient jdbcClient,
             JdbcOutputTableHandle handle,
             RemoteTableName remoteTableName,
-            List<String> columnNames)
+            String effectiveTableName,
+            List<String> columnNames,
+            List<Type> columnTypes)
             throws SQLException
     {
         Map<String, Boolean> nullableByName = new HashMap<>();
@@ -351,7 +365,7 @@ public class ClickHouseNativePageSink
         try (Connection connection = jdbcClient.getConnection(session, handle);
                 PreparedStatement statement = connection.prepareStatement(sql)) {
             statement.setString(1, remoteTableName.getSchemaName().orElse(""));
-            statement.setString(2, remoteTableName.getTableName());
+            statement.setString(2, effectiveTableName);
             try (ResultSet resultSet = statement.executeQuery()) {
                 while (resultSet.next()) {
                     String name = resultSet.getString("name");
@@ -360,16 +374,17 @@ public class ClickHouseNativePageSink
                 }
             }
         }
-        checkState(!nullableByName.isEmpty(), "No columns found in system.columns for %s", remoteTableName);
 
         ImmutableList.Builder<Boolean> flags = ImmutableList.builder();
-        List<String> allColumns = new ArrayList<>(columnNames);
-        handle.getPageSinkIdColumnName().ifPresent(allColumns::add);
-        for (String columnName : allColumns) {
+        for (int i = 0; i < columnNames.size(); i++) {
+            String columnName = columnNames.get(i);
             Boolean nullable = nullableByName.get(columnName);
-            checkState(nullable != null, "Column %s not found in system.columns for %s", columnName, remoteTableName);
-            flags.add(nullable);
+            // Fall back to the DDL rule when the column is not (yet) in system.columns (CREATE TABLE AS SELECT).
+            flags.add(nullable != null ? nullable : isNullableElement(columnTypes.get(i)));
         }
+        // The trailing trino_page_sink_id column is BIGINT -> Nullable(Int64) (a scalar, so always Nullable).
+        handle.getPageSinkIdColumnName().ifPresent(name ->
+                flags.add(nullableByName.getOrDefault(name, Boolean.TRUE)));
         return flags.build();
     }
 
