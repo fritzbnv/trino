@@ -27,6 +27,7 @@ import io.trino.spi.Page;
 import io.trino.spi.TrinoException;
 import io.trino.spi.block.Block;
 import io.trino.spi.block.SqlMap;
+import io.trino.spi.block.SqlRow;
 import io.trino.spi.connector.ConnectorPageSink;
 import io.trino.spi.connector.ConnectorPageSinkId;
 import io.trino.spi.connector.ConnectorSession;
@@ -37,6 +38,7 @@ import io.trino.spi.type.Int128;
 import io.trino.spi.type.LongTimestamp;
 import io.trino.spi.type.LongTimestampWithTimeZone;
 import io.trino.spi.type.MapType;
+import io.trino.spi.type.RowType;
 import io.trino.spi.type.TimestampType;
 import io.trino.spi.type.TimestampWithTimeZoneType;
 import io.trino.spi.type.Type;
@@ -514,6 +516,24 @@ public class ClickHouseNativePageSink
                 }
             };
         }
+        if (type instanceof RowType rowType) {
+            // ClickHouse Tuple(T1, ..., Tn) RowBinary layout is simply encode(f1) encode(f2) ... encode(fn) with NO
+            // count/length prefix (unlike Array/Map which carry a varint size). Each field carries its Nullable null-flag
+            // byte exactly when its type is nullable-eligible (scalars: yes; nested Array/Map/Row containers: no), the
+            // same rule as clickHouseElementDataType uses for the Tuple field DDL.
+            List<Type> fieldTypes = rowType.getTypeParameters();
+            List<ColumnEncoder> fieldEncoders = new ArrayList<>(fieldTypes.size());
+            for (Type fieldType : fieldTypes) {
+                fieldEncoders.add(new ColumnEncoder(valueEncoder(fieldType), isNullableElement(fieldType)));
+            }
+            return (out, block, position) -> {
+                SqlRow sqlRow = rowType.getObject(block, position);
+                int rawIndex = sqlRow.getRawIndex();
+                for (int i = 0; i < fieldEncoders.size(); i++) {
+                    fieldEncoders.get(i).encode(out, sqlRow.getRawFieldBlock(i), rawIndex);
+                }
+            };
+        }
         // UUID, JSON, IPv4/IPv6 and other slice-mapped types are written to a ClickHouse String column by the JDBC path;
         // they are outside the scope of this native sink's supported set. Fail fast rather than corrupt rows.
         throw new TrinoException(JDBC_ERROR, "ClickHouse native RowBinary sink does not support column type: " + type);
@@ -521,8 +541,8 @@ public class ClickHouseNativePageSink
 
     private static boolean isNullableElement(Type type)
     {
-        // Mirror ClickHouseClient.clickHouseElementDataType / isClickHouseNonNullableContainer: Array/Map cannot be
+        // Mirror ClickHouseClient.clickHouseElementDataType / isClickHouseNonNullableContainer: Array/Map/Tuple cannot be
         // wrapped in Nullable, so they are emitted bare; every other (scalar) element is Nullable(T).
-        return !(type instanceof ArrayType) && !(type instanceof MapType);
+        return !(type instanceof ArrayType) && !(type instanceof MapType) && !(type instanceof RowType);
     }
 }

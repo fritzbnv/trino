@@ -70,7 +70,9 @@ import io.trino.spi.TrinoException;
 import io.trino.spi.block.Block;
 import io.trino.spi.block.BlockBuilder;
 import io.trino.spi.block.MapBlockBuilder;
+import io.trino.spi.block.RowBlockBuilder;
 import io.trino.spi.block.SqlMap;
+import io.trino.spi.block.SqlRow;
 import io.trino.spi.connector.AggregateFunction;
 import io.trino.spi.connector.ColumnHandle;
 import io.trino.spi.connector.ColumnMetadata;
@@ -90,6 +92,7 @@ import io.trino.spi.type.LongTimestamp;
 import io.trino.spi.type.LongTimestampWithTimeZone;
 import io.trino.spi.type.MapType;
 import io.trino.spi.type.NumberType;
+import io.trino.spi.type.RowType;
 import io.trino.spi.type.StandardTypes;
 import io.trino.spi.type.TimeZoneKey;
 import io.trino.spi.type.TimestampType;
@@ -579,8 +582,9 @@ public class ClickHouseClient
 
     private static boolean isClickHouseNonNullableContainer(Type type)
     {
-        // ClickHouse rejects Nullable(Array(...)) and Nullable(Map(...)); these types represent absence as an empty container.
-        return type instanceof ArrayType || type instanceof MapType;
+        // ClickHouse rejects Nullable(Array(...)), Nullable(Map(...)) and Nullable(Tuple(...)); these types represent
+        // absence as an empty container (Array/Map) or per-field nullability (Tuple).
+        return type instanceof ArrayType || type instanceof MapType || type instanceof RowType;
     }
 
     private String clickHouseElementDataType(ConnectorSession session, Type elementType)
@@ -885,6 +889,7 @@ public class ClickHouseClient
             case UUID -> Optional.of(uuidColumnMapping());
             case Array -> arrayColumnMapping(session, connection, column);
             case Map -> mapColumnMapping(session, connection, column);
+            case Tuple -> rowColumnMapping(session, connection, column);
             default -> Optional.empty();
         };
         if (clickHouseDataTypeMapping.isPresent()) {
@@ -1045,7 +1050,9 @@ public class ClickHouseClient
             builder.appendNull();
         }
         else {
-            writeNativeValue(elementType, builder, toTrinoArrayElement(elementType, element));
+            // Route container element types (nested Array/Map/Row) through toTrinoMapElement, which recursively builds
+            // their Trino block; scalars fall through to toTrinoArrayElement inside toTrinoMapElement.
+            writeNativeValue(elementType, builder, toTrinoMapElement(elementType, element));
         }
     }
 
@@ -1117,6 +1124,60 @@ public class ClickHouseClient
                 Optional.empty());
     }
 
+    private Optional<ColumnMapping> rowColumnMapping(ConnectorSession session, Connection connection, ClickHouseColumn tupleColumn)
+    {
+        // ClickHouse Tuple(name1 T1, ...) maps to Trino row(name1 T1, ...). Recurse per nested field column to build the
+        // Trino field types, mirroring how arrayColumnMapping/mapColumnMapping recurse into their element/key/value.
+        List<ClickHouseColumn> fieldColumns = tupleColumn.getNestedColumns();
+        if (fieldColumns.isEmpty()) {
+            return Optional.empty();
+        }
+        ImmutableList.Builder<RowType.Field> fields = ImmutableList.builder();
+        for (int i = 0; i < fieldColumns.size(); i++) {
+            ClickHouseColumn fieldColumn = fieldColumns.get(i);
+            Optional<ColumnMapping> fieldMapping = toColumnMapping(session, connection, mapElementTypeHandle(fieldColumn));
+            if (fieldMapping.isEmpty()) {
+                return Optional.empty();
+            }
+            // ClickHouse named-tuple fields carry a column name; keep it as the Trino field name. Unnamed tuple fields
+            // (Tuple(T1, T2)) report a blank/auto name, so fall back to a stable positional name.
+            String fieldName = fieldColumn.getColumnName();
+            if (isNullOrEmpty(fieldName)) {
+                fieldName = "field" + (i + 1);
+            }
+            fields.add(RowType.field(fieldName, fieldMapping.get().getType()));
+        }
+        RowType rowType = RowType.from(fields.build());
+        return Optional.of(ColumnMapping.objectMapping(rowType, rowReadFunction(rowType), rowWriteFunction(rowType)));
+    }
+
+    private static ObjectReadFunction rowReadFunction(RowType rowType)
+    {
+        List<Type> fieldTypes = rowType.getTypeParameters();
+        // The clickhouse-jdbc driver returns a Tuple column value as an Object[] of field values in declared field order
+        // (BinaryStreamReader.readTuple). Build the Trino row block from that array, reusing toTrinoMapElement so nested
+        // scalars/arrays/maps are converted to their Trino native representation exactly as for map values.
+        return ObjectReadFunction.of(SqlRow.class, (resultSet, columnIndex) -> {
+            Object value = resultSet.getObject(columnIndex);
+            Object[] fieldValues = value instanceof List<?> list ? list.toArray() : (Object[]) value;
+            RowBlockBuilder blockBuilder = (RowBlockBuilder) rowType.createBlockBuilder(null, 1);
+            blockBuilder.buildEntry(fieldBuilders -> {
+                for (int i = 0; i < fieldTypes.size(); i++) {
+                    Type fieldType = fieldTypes.get(i);
+                    BlockBuilder fieldBuilder = fieldBuilders.get(i);
+                    Object fieldValue = fieldValues[i];
+                    if (fieldValue == null) {
+                        fieldBuilder.appendNull();
+                    }
+                    else {
+                        writeNativeValue(fieldType, fieldBuilder, toTrinoMapElement(fieldType, fieldValue));
+                    }
+                }
+            });
+            return rowType.getObject(blockBuilder.build(), 0);
+        });
+    }
+
     private static ObjectReadFunction mapReadFunction(MapType mapType)
     {
         Type keyType = mapType.getKeyType();
@@ -1160,6 +1221,47 @@ public class ClickHouseClient
             }
             return builder.build();
         }
+        if (type instanceof MapType mapType) {
+            // Nested map values (e.g. Array(Map(...)) or Tuple(..., Map(...))) come back as a java.util.Map; build the
+            // Trino SqlMap the same way mapReadFunction does for a top-level Map column.
+            Type keyType = mapType.getKeyType();
+            Type valueType = mapType.getValueType();
+            Map<?, ?> map = (Map<?, ?>) value;
+            BlockBuilder blockBuilder = mapType.createBlockBuilder(null, 1);
+            ((MapBlockBuilder) blockBuilder).buildEntry((keyBuilder, valueBuilder) -> {
+                for (Map.Entry<?, ?> entry : map.entrySet()) {
+                    writeNativeValue(keyType, keyBuilder, toTrinoMapElement(keyType, entry.getKey()));
+                    if (entry.getValue() == null) {
+                        valueBuilder.appendNull();
+                    }
+                    else {
+                        writeNativeValue(valueType, valueBuilder, toTrinoMapElement(valueType, entry.getValue()));
+                    }
+                }
+            });
+            return mapType.getObject(blockBuilder.build(), 0);
+        }
+        if (type instanceof RowType rowType) {
+            // Nested tuple values (e.g. Array(Tuple(...)) or Tuple(..., Tuple(...))) come back as an Object[] (or List)
+            // of field values in declared field order; build the Trino row block recursively.
+            List<Type> fieldTypes = rowType.getTypeParameters();
+            Object[] fieldValues = value instanceof List<?> list ? list.toArray() : (Object[]) value;
+            RowBlockBuilder blockBuilder = (RowBlockBuilder) rowType.createBlockBuilder(null, 1);
+            blockBuilder.buildEntry(fieldBuilders -> {
+                for (int i = 0; i < fieldTypes.size(); i++) {
+                    Type fieldType = fieldTypes.get(i);
+                    BlockBuilder fieldBuilder = fieldBuilders.get(i);
+                    Object fieldValue = fieldValues[i];
+                    if (fieldValue == null) {
+                        fieldBuilder.appendNull();
+                    }
+                    else {
+                        writeNativeValue(fieldType, fieldBuilder, toTrinoMapElement(fieldType, fieldValue));
+                    }
+                }
+            });
+            return rowType.getObject(blockBuilder.build(), 0);
+        }
         return toTrinoArrayElement(type, value);
     }
 
@@ -1176,6 +1278,30 @@ public class ClickHouseClient
                 map.put(keyType.getObjectValue(keyBlock, rawOffset + i), valueType.getObjectValue(valueBlock, rawOffset + i));
             }
             statement.setObject(index, map);
+        });
+    }
+
+    private static String rowFieldName(RowType.Field field, int index)
+    {
+        // ClickHouse Tuple fields are named. Trino row fields may be anonymous (RowType.Field.getName() == empty), e.g.
+        // for row(array(...)) produced by array_agg without aliases; use a stable positional synthetic name in that case.
+        return field.getName().orElse("field" + (index + 1));
+    }
+
+    private static ObjectWriteFunction rowWriteFunction(RowType rowType)
+    {
+        // The native RowBinary sink (ClickHouseNativePageSink) performs the actual encoding of row/Tuple columns. This
+        // write function only needs to satisfy the WriteMapping API for the (unused for RowType) JDBC batch path; it maps
+        // a Trino row into a positional List of field values that clickhouse-jdbc would bind for a Tuple parameter.
+        List<Type> fieldTypes = rowType.getTypeParameters();
+        return ObjectWriteFunction.of(SqlRow.class, (statement, index, sqlRow) -> {
+            int rawIndex = sqlRow.getRawIndex();
+            List<Object> values = new ArrayList<>(fieldTypes.size());
+            for (int i = 0; i < fieldTypes.size(); i++) {
+                Block fieldBlock = sqlRow.getRawFieldBlock(i);
+                values.add(fieldTypes.get(i).getObjectValue(fieldBlock, rawIndex));
+            }
+            statement.setObject(index, values);
         });
     }
 
@@ -1279,6 +1405,24 @@ public class ClickHouseClient
             String keyDataType = toWriteMapping(session, mapType.getKeyType()).getDataType();
             String valueDataType = clickHouseElementDataType(session, mapType.getValueType());
             return WriteMapping.objectMapping(format("Map(%s, %s)", keyDataType, valueDataType), mapWriteFunction(mapType));
+        }
+        if (type instanceof RowType rowType) {
+            // Trino row(...) maps to a ClickHouse named Tuple(name1 T1, name2 T2, ...). Each field type reuses
+            // clickHouseElementDataType so scalar fields are Nullable(T) and nested containers (Array/Map/Tuple) are bare,
+            // exactly like array elements and map values.
+            List<RowType.Field> fields = rowType.getFields();
+            StringBuilder dataType = new StringBuilder("Tuple(");
+            for (int i = 0; i < fields.size(); i++) {
+                RowType.Field field = fields.get(i);
+                if (i > 0) {
+                    dataType.append(", ");
+                }
+                dataType.append(quoted(rowFieldName(field, i)))
+                        .append(" ")
+                        .append(clickHouseElementDataType(session, field.getType()));
+            }
+            dataType.append(")");
+            return WriteMapping.objectMapping(dataType.toString(), rowWriteFunction(rowType));
         }
         throw new TrinoException(NOT_SUPPORTED, "Unsupported column type: " + type);
     }
