@@ -197,4 +197,36 @@ final class TestClickHouseNativeSinkCtas
             queryRunner.execute("DROP TABLE IF EXISTS clickhouse.tpch." + table);
         }
     }
+
+    @Test
+    void testCreateTableAsSelectNullContainers()
+    {
+        // A NULL whole-column value for a bare (non-Nullable) container: ClickHouse cannot wrap Array/Map/Tuple in
+        // Nullable(...), so a null array/map/row column must be written as the empty/default container, not rejected.
+        // Regression for "Unexpected null in non-nullable ClickHouse column" (prod superset_sit_session.sit_regions,
+        // an array(varchar) that is NULL in ~98% of rows).
+        String table = "ctas_nullcontainers_" + randomNameSuffix();
+        try {
+            queryRunner.execute("CREATE TABLE clickhouse.tpch." + table + " (id, arr, m, r) " +
+                    "WITH (engine = 'MergeTree') AS " +
+                    "SELECT CAST(n AS bigint), " +
+                    "  CASE WHEN n = 1 THEN ARRAY['x','y'] ELSE CAST(NULL AS array(varchar)) END, " +
+                    "  CASE WHEN n = 1 THEN MAP(ARRAY['k'], ARRAY[1]) ELSE CAST(NULL AS map(varchar,integer)) END, " +
+                    "  CASE WHEN n = 1 THEN CAST(ROW(1,'a') AS ROW(x integer, y varchar)) ELSE CAST(NULL AS ROW(x integer, y varchar)) END " +
+                    "FROM (VALUES 1, 2) t(n)");
+            assertThat((long) queryRunner.execute("SELECT count(*) FROM clickhouse.tpch." + table).getOnlyValue())
+                    .isEqualTo(2L);
+            // The null-container rows read back as empty array/map and a default-valued row (fields null), not as errors.
+            assertThat((long) queryRunner.execute("SELECT cardinality(arr) FROM clickhouse.tpch." + table + " WHERE id = 2").getOnlyValue())
+                    .isEqualTo(0L);
+            assertThat((long) queryRunner.execute("SELECT cardinality(map_keys(m)) FROM clickhouse.tpch." + table + " WHERE id = 2").getOnlyValue())
+                    .isEqualTo(0L);
+            // The non-null row still round-trips.
+            assertThat(queryRunner.execute("SELECT r.x FROM clickhouse.tpch." + table + " WHERE id = 1").getOnlyValue())
+                    .isEqualTo(1);
+        }
+        finally {
+            queryRunner.execute("DROP TABLE IF EXISTS clickhouse.tpch." + table);
+        }
+    }
 }

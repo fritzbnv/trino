@@ -172,8 +172,10 @@ public class ClickHouseNativePageSink
 
         ImmutableList.Builder<ColumnEncoder> encoders = ImmutableList.builder();
         for (int i = 0; i < columnTypes.size(); i++) {
-            ValueEncoder valueEncoder = valueEncoder(columnTypes.get(i));
-            encoders.add(new ColumnEncoder(valueEncoder, nullableFlags.get(i)));
+            Type columnType = columnTypes.get(i);
+            // A null in a non-Nullable column only happens for a bare container (Array/Map/Tuple); emptyEncoder lets the
+            // sink write its empty/default form (empty array/map, default-valued tuple) instead of failing.
+            encoders.add(new ColumnEncoder(valueEncoder(columnType), nullableFlags.get(i), emptyEncoder(columnType)));
         }
         if (includePageSinkIdColumn) {
             // The trailing trino_page_sink_id column (BIGINT -> Nullable(Int64)) exists only under fault-tolerant execution.
@@ -392,21 +394,47 @@ public class ClickHouseNativePageSink
         return flags.build();
     }
 
-    // A top-level column: optionally emits the Nullable null-flag byte, then delegates to the value encoder.
-    private record ColumnEncoder(ValueEncoder valueEncoder, boolean nullable)
+    // A top-level column (or nested element/field): emits the Nullable null-flag byte when the slot is Nullable, then
+    // delegates to the value encoder. A null in a NON-nullable slot only happens for a container column/field
+    // (Array/Map/Tuple), which ClickHouse cannot wrap in Nullable(...); the idiomatic mapping writes the empty/default
+    // container (empty Array/Map, default-valued Tuple) rather than failing -- matching the clickhouse-jdbc path.
+    private record ColumnEncoder(ValueEncoder valueEncoder, boolean nullable, EmptyEncoder emptyEncoder)
     {
+        ColumnEncoder(ValueEncoder valueEncoder, boolean nullable)
+        {
+            this(valueEncoder, nullable, null);
+        }
+
         void encode(OutputStream out, Block block, int position)
                 throws IOException
         {
             if (block.isNull(position)) {
-                checkState(nullable, "Unexpected null in non-nullable ClickHouse column");
-                BinaryStreamUtils.writeNull(out);
+                if (nullable) {
+                    BinaryStreamUtils.writeNull(out);
+                    return;
+                }
+                // Non-nullable slot: only reachable for a bare container (Array/Map/Tuple). Write its empty/default form.
+                checkState(emptyEncoder != null, "Unexpected null in non-nullable ClickHouse column");
+                emptyEncoder.encodeEmpty(out);
                 return;
             }
             if (nullable) {
                 BinaryStreamUtils.writeNonNull(out);
             }
             valueEncoder.encode(out, block, position);
+        }
+
+        // Writes this slot's empty/default form (for a null Tuple's fields): a Nullable scalar writes its null flag; a
+        // bare nested container writes its empty form.
+        void encodeEmptyField(OutputStream out)
+                throws IOException
+        {
+            if (nullable) {
+                BinaryStreamUtils.writeNull(out);
+                return;
+            }
+            checkState(emptyEncoder != null, "Unexpected non-nullable scalar Tuple field");
+            emptyEncoder.encodeEmpty(out);
         }
 
         void encodeLong(OutputStream out, long value)
@@ -425,6 +453,42 @@ public class ClickHouseNativePageSink
     {
         void encode(OutputStream out, Block block, int position)
                 throws IOException;
+    }
+
+    // Writes the empty/default RowBinary form of a bare (non-Nullable) container when its column value is null.
+    @FunctionalInterface
+    private interface EmptyEncoder
+    {
+        void encodeEmpty(OutputStream out)
+                throws IOException;
+    }
+
+    /**
+     * The empty/default RowBinary form for a bare container type (used when a non-Nullable Array/Map/Tuple column or
+     * field is null): an Array/Map writes a zero length; a Tuple writes each field's null/empty form (a Tuple has no
+     * null of its own in ClickHouse). Returns null for scalars, which are always Nullable and never take this path.
+     */
+    private static EmptyEncoder emptyEncoder(Type type)
+    {
+        if (type instanceof ArrayType || type instanceof MapType) {
+            // Empty Array(T) / Map(K,V): just the varint element/pair count 0.
+            return out -> BinaryStreamUtils.writeVarInt(out, 0);
+        }
+        if (type instanceof RowType rowType) {
+            // A null Tuple has no ClickHouse representation; emit each field's empty/default: a Nullable scalar field
+            // writes its null flag, a bare nested container writes its own empty form.
+            List<Type> fieldTypes = rowType.getTypeParameters();
+            List<ColumnEncoder> fieldEncoders = new ArrayList<>(fieldTypes.size());
+            for (Type fieldType : fieldTypes) {
+                fieldEncoders.add(new ColumnEncoder(valueEncoder(fieldType), isNullableElement(fieldType), emptyEncoder(fieldType)));
+            }
+            return out -> {
+                for (ColumnEncoder fieldEncoder : fieldEncoders) {
+                    fieldEncoder.encodeEmptyField(out);
+                }
+            };
+        }
+        return null;
     }
 
     private static ValueEncoder valueEncoder(Type type)
@@ -517,7 +581,7 @@ public class ClickHouseNativePageSink
         if (type instanceof ArrayType arrayType) {
             Type elementType = arrayType.getElementType();
             // Array elements: scalars are Nullable(T), nested Array/Map are bare (matches clickHouseElementDataType).
-            ColumnEncoder elementEncoder = new ColumnEncoder(valueEncoder(elementType), isNullableElement(elementType));
+            ColumnEncoder elementEncoder = new ColumnEncoder(valueEncoder(elementType), isNullableElement(elementType), emptyEncoder(elementType));
             return (out, block, position) -> {
                 Block array = arrayType.getObject(block, position);
                 BinaryStreamUtils.writeVarInt(out, array.getPositionCount());
@@ -530,8 +594,8 @@ public class ClickHouseNativePageSink
             Type keyType = mapType.getKeyType();
             Type valueType = mapType.getValueType();
             // Map keys are never Nullable; values are Nullable(T) for scalars, bare for nested containers.
-            ColumnEncoder keyEncoder = new ColumnEncoder(valueEncoder(keyType), false);
-            ColumnEncoder valueEncoder = new ColumnEncoder(valueEncoder(valueType), isNullableElement(valueType));
+            ColumnEncoder keyEncoder = new ColumnEncoder(valueEncoder(keyType), false, emptyEncoder(keyType));
+            ColumnEncoder valueEncoder = new ColumnEncoder(valueEncoder(valueType), isNullableElement(valueType), emptyEncoder(valueType));
             return (out, block, position) -> {
                 SqlMap sqlMap = mapType.getObject(block, position);
                 int rawOffset = sqlMap.getRawOffset();
@@ -553,7 +617,7 @@ public class ClickHouseNativePageSink
             List<Type> fieldTypes = rowType.getTypeParameters();
             List<ColumnEncoder> fieldEncoders = new ArrayList<>(fieldTypes.size());
             for (Type fieldType : fieldTypes) {
-                fieldEncoders.add(new ColumnEncoder(valueEncoder(fieldType), isNullableElement(fieldType)));
+                fieldEncoders.add(new ColumnEncoder(valueEncoder(fieldType), isNullableElement(fieldType), emptyEncoder(fieldType)));
             }
             return (out, block, position) -> {
                 SqlRow sqlRow = rowType.getObject(block, position);
