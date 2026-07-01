@@ -338,6 +338,11 @@ public class ClickHouseNativePageSink
                 .addEndpoint(endpoint)
                 .setUsername(user.orElse("default"))
                 .setPassword(password.orElse(""))
+                // The insert consumes a PipedInputStream, which cannot be rewound (markSupported()==false). Client V2's
+                // default retry would call mark()/reset() to replay the request body and fail with "mark/reset not
+                // supported" -- observed on long (100M+ row) inserts where a transient blip triggered a retry. A piped,
+                // streamed body is inherently non-replayable, so disable retries and let the failure surface instead.
+                .setMaxRetries(0)
                 .compressClientRequest(true);
         database.ifPresent(builder::setDefaultDatabase);
         return builder.build();
